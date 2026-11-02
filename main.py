@@ -22,7 +22,6 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class Config:
     token: str
-    owner_id: int
     database: Path
     media_dir: Path
     max_media_bytes: int
@@ -31,9 +30,8 @@ class Config:
     def from_env(cls) -> Config:
         load_dotenv()
         token = os.getenv('BOT_TOKEN', '').strip()
-        owner = os.getenv('OWNER_TELEGRAM_ID', '').strip()
-        if not token or not owner.isdigit() or int(owner) <= 0:
-            raise ValueError('Укажите BOT_TOKEN и положительный OWNER_TELEGRAM_ID в .env')
+        if not token:
+            raise ValueError('Укажите BOT_TOKEN в .env')
         url = os.getenv('DATABASE_URL', 'sqlite+aiosqlite:///data/app.db')
         prefix = 'sqlite+aiosqlite:///'
         if not url.startswith(prefix):
@@ -44,7 +42,7 @@ class Config:
         max_mb = int(os.getenv('MAX_MEDIA_SIZE_MB', os.getenv('SAVE_MEDIA_MAX_MB', '50')))
         if max_mb <= 0:
             raise ValueError('MAX_MEDIA_SIZE_MB должен быть больше 0')
-        return cls(token, int(owner), Path(database), Path(os.getenv('MEDIA_DIR', 'data/media')), max_mb * 1024 * 1024)
+        return cls(token, Path(database), Path(os.getenv('MEDIA_DIR', 'data/media')), max_mb * 1024 * 1024)
 
 
 class Store:
@@ -56,7 +54,8 @@ class Store:
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS save_connections (
-                connection_id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, enabled INTEGER NOT NULL
+                connection_id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, enabled INTEGER NOT NULL,
+                user_chat_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS save_messages (
                 connection_id TEXT NOT NULL, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
@@ -70,6 +69,8 @@ class Store:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
         ''')
+        if 'user_chat_id' not in {r[1] for r in self.db.execute('PRAGMA table_info(save_connections)')}:
+            self.db.execute('ALTER TABLE save_connections ADD COLUMN user_chat_id INTEGER')
         if 'media_unique_id' not in {r[1] for r in self.db.execute('PRAGMA table_info(save_messages)')}:
             self.db.execute('ALTER TABLE save_messages ADD COLUMN media_unique_id TEXT')
         self.migrate_legacy()
@@ -96,10 +97,18 @@ class Store:
     def connection(self, connection_id: str):
         return self.db.execute('SELECT * FROM save_connections WHERE connection_id=?', (connection_id,)).fetchone()
 
-    def save_connection(self, connection: BusinessConnection):
-        self.db.execute('INSERT OR REPLACE INTO save_connections VALUES (?, ?, ?)',
-                        (connection.id, connection.user.id, int(connection.is_enabled)))
+    def save_connection(self, connection: BusinessConnection) -> bool:
+        existing = self.connection(connection.id)
+        # Never transfer an existing archive to a different account.
+        if existing and existing['owner_id'] != connection.user.id:
+            log.error('Владелец Business-подключения изменился; событие отклонено')
+            return False
+        self.db.execute('''INSERT INTO save_connections (connection_id, owner_id, enabled, user_chat_id)
+            VALUES (?, ?, ?, ?) ON CONFLICT(connection_id) DO UPDATE SET
+            enabled=excluded.enabled, user_chat_id=excluded.user_chat_id''',
+            (connection.id, connection.user.id, int(connection.is_enabled), connection.user_chat_id))
         self.db.commit()
+        return True
 
     def get(self, conn: str, chat: int, msg: int):
         return self.db.execute('SELECT * FROM save_messages WHERE connection_id=? AND chat_id=? AND message_id=?',
@@ -207,7 +216,7 @@ def escape(value, limit=1000):
     return html.escape(str(value or '—')[:limit])
 
 
-async def notify(bot: Bot, cfg: Config, title: str, row, body: str, *, send_media=False):
+async def notify(bot: Bot, cfg: Config, user_chat_id: int, title: str, row, body: str, *, send_media=False):
     text = (f'<b>{escape(title)}</b>\nЧат: {escape(row["chat_title"], 120)} '
             f'(<code>{row["chat_id"]}</code>)\nАвтор: {escape(row["sender_name"], 120)}\n\n{body}')
     path = row['media_path']
@@ -220,8 +229,8 @@ async def notify(bot: Bot, cfg: Config, title: str, row, body: str, *, send_medi
                 method = {'photo': bot.send_photo, 'video': bot.send_video, 'animation': bot.send_animation,
                           'voice': bot.send_voice, 'audio': bot.send_audio}.get(kind, bot.send_document)
                 # Send the text separately to avoid Telegram's 1024-character caption limit.
-                await bot.send_message(cfg.owner_id, text, parse_mode='HTML')
-                await method(cfg.owner_id, FSInputFile(candidate))
+                await bot.send_message(user_chat_id, text, parse_mode='HTML')
+                await method(user_chat_id, FSInputFile(candidate))
                 return
             except Exception:
                 log.exception('Не удалось отправить сохранённое медиа')
@@ -229,52 +238,54 @@ async def notify(bot: Bot, cfg: Config, title: str, row, body: str, *, send_medi
                 return
     if send_media and row['media_type']:
         text += f'\n\nМедиа недоступно: {escape(row["media_status"])}'
-    await bot.send_message(cfg.owner_id, text, parse_mode='HTML')
+    await bot.send_message(user_chat_id, text, parse_mode='HTML')
 
 
 class SaveBot:
     def __init__(self, cfg: Config, store: Store):
         self.cfg, self.store = cfg, store
 
-    async def allowed(self, bot: Bot, connection_id: str | None) -> bool:
+    async def allowed(self, bot: Bot, connection_id: str | None):
         if not connection_id:
-            return False
+            return None
         row = self.store.connection(connection_id)
-        if row is None:
+        # Older databases did not store the notification chat. Verify them with Telegram.
+        if row is None or row['user_chat_id'] is None:
             try:
                 connection = await bot.get_business_connection(connection_id)
             except Exception:
                 log.warning('Не удалось проверить Business-подключение')
-                return False
-            self.store.save_connection(connection)
+                return None
+            if connection.id != connection_id or not self.store.save_connection(connection):
+                return None
             row = self.store.connection(connection_id)
-        return bool(row and row['owner_id'] == self.cfg.owner_id and row['enabled'])
+        return row if row and row['enabled'] else None
 
     async def connection(self, connection: BusinessConnection, bot: Bot):
-        self.store.save_connection(connection)
-        if connection.user.id == self.cfg.owner_id:
-            status = 'подключён' if connection.is_enabled else 'отключён'
-            await bot.send_message(self.cfg.owner_id, f'Save Mode {status}.')
+        if not self.store.save_connection(connection):
+            return
+        status = 'подключён' if connection.is_enabled else 'отключён'
+        await bot.send_message(connection.user_chat_id, f'Save Mode {status}.')
 
     async def start(self, message: Message):
-        if message.from_user and message.from_user.id == self.cfg.owner_id:
-            await message.answer('Save Mode работает. Подключите бота в настройках Telegram Business.')
+        await message.answer('Save Mode работает. Подключите бота в настройках Telegram Business.')
 
     async def message(self, message: Message, bot: Bot, edited=False):
-        if not await self.allowed(bot, message.business_connection_id):
+        connection = await self.allowed(bot, message.business_connection_id)
+        if not connection:
             return
         # No sender means ownership cannot be established safely. Do not notify on it.
         sender = message.from_user
         if not sender:
             return
-        if sender.id == self.cfg.owner_id:
+        if sender.id == connection['owner_id']:
             if not edited:
-                await self.save_reply(message, bot)
+                await self.save_reply(message, bot, connection)
             return
         conn, chat, msg = message.business_connection_id, message.chat.id, message.message_id
         old = self.store.get(conn, chat, msg)
         # A message previously known to be outgoing must never produce a notification.
-        if old and old['sender_id'] == self.cfg.owner_id:
+        if old and old['sender_id'] == connection['owner_id']:
             return
         if old and old['deleted']:
             return
@@ -291,22 +302,22 @@ class SaveBot:
             if body != old['body'] or media != (old['media_type'], old['media_path'], old['media_status']) or unique_id != old['media_unique_id']:
                 self.store.edit(row, old)
                 current = self.store.get(conn, chat, msg)
-                await notify(bot, self.cfg, 'Сообщение изменено', current,
+                await notify(bot, self.cfg, connection['user_chat_id'], 'Сообщение изменено', current,
                              f'Было: {escape(old["body"], 1000)}\nСтало: {escape(body, 1000)}')
         else:
             self.store.save(row)
             if edited:
                 current = self.store.get(conn, chat, msg)
-                await notify(bot, self.cfg, 'Сообщение изменено', current,
+                await notify(bot, self.cfg, connection['user_chat_id'], 'Сообщение изменено', current,
                              f'Было: [нет старой версии]\nСтало: {escape(body, 1000)}')
         if not edited and not old and kind and expiring_hint(message):
             current = self.store.get(conn, chat, msg)
-            await notify(bot, self.cfg, 'Исчезающее медиа', current,
+            await notify(bot, self.cfg, connection['user_chat_id'], 'Исчезающее медиа', current,
                          f'Текст: {escape(body, 1000)}', send_media=True)
 
-    async def save_reply(self, message: Message, bot: Bot):
+    async def save_reply(self, message: Message, bot: Bot, connection):
         reply = message.reply_to_message
-        if not reply or not reply.from_user or reply.from_user.id == self.cfg.owner_id:
+        if not reply or not reply.from_user or reply.from_user.id == connection['owner_id']:
             return
         command = (message.text or message.caption or '').strip().lower()
         if command not in {'/save', '.save', 'save', 'сохрани', '.сейв', '/сейв'} and not expiring_hint(reply):
@@ -315,7 +326,7 @@ class SaveBot:
             return
         reply = reply.model_copy(update={'business_connection_id': message.business_connection_id})
         old = self.store.get(message.business_connection_id, reply.chat.id, reply.message_id)
-        if old and (old['deleted'] or old['sender_id'] == self.cfg.owner_id):
+        if old and (old['deleted'] or old['sender_id'] == connection['owner_id']):
             return
         media = await download_media(bot, reply, self.cfg)
         unique_id = getattr(extract_media(reply)[1], 'file_unique_id', None)
@@ -324,20 +335,21 @@ class SaveBot:
                *media, unique_id)
         self.store.save(row)
         current = self.store.get(message.business_connection_id, reply.chat.id, reply.message_id)
-        await notify(bot, self.cfg, 'Медиа из ответа', current,
+        await notify(bot, self.cfg, connection['user_chat_id'], 'Медиа из ответа', current,
                      f'Текст: {escape(current["body"], 1000)}', send_media=True)
 
     async def deleted(self, deleted: BusinessMessagesDeleted, bot: Bot):
-        if not await self.allowed(bot, deleted.business_connection_id):
+        connection = await self.allowed(bot, deleted.business_connection_id)
+        if not connection:
             return
         for msg_id in deleted.message_ids:
             row = self.store.get(deleted.business_connection_id, deleted.chat.id, msg_id)
             if not row or row['deleted']:
                 continue
             self.store.mark_deleted(deleted.business_connection_id, deleted.chat.id, msg_id)
-            if row['sender_id'] == self.cfg.owner_id:
+            if row['sender_id'] == connection['owner_id']:
                 continue
-            await notify(bot, self.cfg, 'Сообщение удалено', row,
+            await notify(bot, self.cfg, connection['user_chat_id'], 'Сообщение удалено', row,
                          f'Текст: {escape(row["body"], 2000)}', send_media=True)
 
 
