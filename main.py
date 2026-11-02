@@ -216,29 +216,130 @@ def escape(value, limit=1000):
     return html.escape(str(value or '—')[:limit])
 
 
-async def notify(bot: Bot, cfg: Config, user_chat_id: int, title: str, row, body: str, *, send_media=False):
-    text = (f'<b>{escape(title)}</b>\nЧат: {escape(row["chat_title"], 120)} '
-            f'(<code>{row["chat_id"]}</code>)\nАвтор: {escape(row["sender_name"], 120)}\n\n{body}')
+FOOTER = '<b>Этот бот KLSave.</b> Максимум функций и меньше ограничений по функционалу.'
+
+
+def sender_link(row) -> str:
+    name = escape(row['sender_name'] or 'Пользователь', 80)
+    sender_id = row['sender_id']
+    if isinstance(sender_id, int) and sender_id > 0:
+        return f'<a href="tg://user?id={sender_id}">{name}</a>'
+    return name
+
+
+async def notify_edit(bot: Bot, user_chat_id: int, row, old_body, new_body):
+    text = (f'<b>Сообщение было изменено!</b>\n\n'
+            f'{sender_link(row)} отредактировал(-а) своё сообщение (#m{row["message_id"]}):\n\n'
+            f'Было: {escape(old_body if old_body is not None else "[нет старой версии]", 800)}\n'
+            f'Стало: {escape(new_body, 800)}\n\n{FOOTER}')
+    await bot.send_message(user_chat_id, text, parse_mode='HTML')
+
+
+def event_text(row, *, deleted: bool, media_caption: bool = False, unavailable: bool = False, upload_failed: bool = False) -> str:
+    """Format the owner-facing notification, keeping captions below Telegram's limit."""
+    name = sender_link(row)
+    message_id = row['message_id']
+    value = row['body'] or ''
+    limit = 250 if media_caption else 1500
+    body = html.escape(value[:limit] + ('…' if len(value) > limit else ''))
+    if deleted:
+        text = (f'<b>Сообщение было удалено!</b>\n\n'
+                f'{name} удалил(-а) своё сообщение (#m{message_id}):\n\n')
+        if row['media_type']:
+            text += f'Тип сообщения: {escape(row["media_type"], 50)}'
+            if value:
+                text += f'\n\n<blockquote>Message: {body}</blockquote>'
+        else:
+            text += f'<blockquote>Message: {body}</blockquote>'
+    else:
+        text = (f'<b>Исчезающее медиа!</b>\n\n'
+                f'{name} отправил(-а) своё сообщение (#m{message_id}):\n\n'
+                f'Message: {body}')
+    if upload_failed:
+        text += '\n\nМедиа недоступно: не удалось отправить файл.'
+    elif unavailable:
+        text += f'\n\nМедиа недоступно: {escape(row["media_status"] or "unavailable", 50)}'
+    return f'{text}\n\n{FOOTER}'
+
+
+async def notify_media_event(bot: Bot, cfg: Config, user_chat_id: int, row, *, deleted: bool):
+    """Use captions when supported; circles and stickers follow the text separately."""
+    kind = row['media_type']
     path = row['media_path']
-    if send_media and path:
-        # A database path must never allow sending unrelated local files.
-        candidate = Path(path).resolve()
-        if candidate.is_relative_to(cfg.media_dir.resolve()) and candidate.is_file():
+    candidate = Path(path).resolve() if path else None
+    exists = bool(candidate and candidate.is_relative_to(cfg.media_dir.resolve()) and candidate.is_file())
+    if not kind or not exists:
+        await bot.send_message(user_chat_id, event_text(row, deleted=deleted, unavailable=bool(kind)), parse_mode='HTML')
+        return
+
+    text_first = kind in {'video_note', 'sticker'}
+    text = event_text(row, deleted=deleted, media_caption=not text_first)
+    if text_first:
+        await bot.send_message(user_chat_id, text, parse_mode='HTML')
+        try:
+            method = bot.send_video_note if kind == 'video_note' else bot.send_sticker
+            await method(user_chat_id, FSInputFile(candidate))
+        except Exception:
+            log.exception('Не удалось отправить сохранённое медиа')
+            await bot.send_message(user_chat_id, 'Не удалось отправить сохранённое медиа.')
+        return
+
+    try:
+        method = {'photo': bot.send_photo, 'video': bot.send_video, 'animation': bot.send_animation,
+                  'voice': bot.send_voice, 'audio': bot.send_audio}.get(kind, bot.send_document)
+        await method(user_chat_id, FSInputFile(candidate), caption=text, parse_mode='HTML')
+    except Exception:
+        log.exception('Не удалось отправить сохранённое медиа')
+        await bot.send_message(user_chat_id, event_text(row, deleted=deleted, upload_failed=True), parse_mode='HTML')
+
+
+def deleted_group_text(rows) -> str:
+    ids = ', '.join(f'#m{row["message_id"]}' for row in rows)
+    lines = []
+    for row in rows:
+        value = row['body'] or (f'[{row["media_type"]}]' if row['media_type'] else '')
+        shortened = value[:400] + ('…' if len(value) > 400 else '')
+        lines.append(f'#m{row["message_id"]}: {html.escape(shortened)}')
+    entries = '\n'.join(lines)
+    return (f'<b>Были удалены сообщения!</b>\n\n'
+            f'{sender_link(rows[0])} удалил(-а) несколько своих сообщений ({ids}):\n\n'
+            f'Message: {entries}\n\n{FOOTER}')
+
+
+async def notify_deleted_group(bot: Bot, cfg: Config, user_chat_id: int, rows):
+    # Keep each HTML message comfortably under Telegram's 4096 UTF-16 unit limit.
+    batches = []
+    batch = []
+    for row in rows:
+        candidate = batch + [row]
+        if batch and len(deleted_group_text(candidate).encode('utf-16-le')) // 2 > 3000:
+            batches.append(batch)
+            batch = [row]
+        else:
+            batch = candidate
+    if batch:
+        batches.append(batch)
+    for batch in batches:
+        await bot.send_message(user_chat_id, deleted_group_text(batch), parse_mode='HTML')
+        for row in batch:
+            kind, path = row['media_type'], row['media_path']
+            if not kind:
+                continue
+            candidate = Path(path).resolve() if path else None
+            if not candidate or not candidate.is_relative_to(cfg.media_dir.resolve()) or not candidate.is_file():
+                await bot.send_message(user_chat_id, f'#m{row["message_id"]}: медиа недоступно.')
+                continue
             try:
-                kind = row['media_type']
-                method = {'photo': bot.send_photo, 'video': bot.send_video, 'animation': bot.send_animation,
-                          'voice': bot.send_voice, 'audio': bot.send_audio}.get(kind, bot.send_document)
-                # Send the text separately to avoid Telegram's 1024-character caption limit.
-                await bot.send_message(user_chat_id, text, parse_mode='HTML')
-                await method(user_chat_id, FSInputFile(candidate))
-                return
+                if kind in {'video_note', 'sticker'}:
+                    method = bot.send_video_note if kind == 'video_note' else bot.send_sticker
+                    await method(user_chat_id, FSInputFile(candidate))
+                else:
+                    method = {'photo': bot.send_photo, 'video': bot.send_video, 'animation': bot.send_animation,
+                              'voice': bot.send_voice, 'audio': bot.send_audio}.get(kind, bot.send_document)
+                    await method(user_chat_id, FSInputFile(candidate), caption=f'#m{row["message_id"]}')
             except Exception:
                 log.exception('Не удалось отправить сохранённое медиа')
-                # Text may already have been sent; do not send it twice.
-                return
-    if send_media and row['media_type']:
-        text += f'\n\nМедиа недоступно: {escape(row["media_status"])}'
-    await bot.send_message(user_chat_id, text, parse_mode='HTML')
+                await bot.send_message(user_chat_id, f'#m{row["message_id"]}: не удалось отправить медиа.')
 
 
 class SaveBot:
@@ -264,8 +365,13 @@ class SaveBot:
     async def connection(self, connection: BusinessConnection, bot: Bot):
         if not self.store.save_connection(connection):
             return
-        status = 'подключён' if connection.is_enabled else 'отключён'
-        await bot.send_message(connection.user_chat_id, f'Save Mode {status}.')
+        if connection.is_enabled:
+            text = ('<b>Business Mode активирован!</b>\n'
+                    '<i>Ты включил(-а) бизнес-режим для KLSave — теперь бот готов принимать сообщения и работать в полном объёме.\n'
+                    'Обрати внимание: данный бот может быть удален из-за правил Telegram, следи за новостями в нашем канале для получения зеркал.</i>')
+            await bot.send_message(connection.user_chat_id, text, parse_mode='HTML')
+        else:
+            await bot.send_message(connection.user_chat_id, 'Business Mode отключён.')
 
     async def start(self, message: Message):
         await message.answer('Save Mode работает. Подключите бота в настройках Telegram Business.')
@@ -302,25 +408,19 @@ class SaveBot:
             if body != old['body'] or media != (old['media_type'], old['media_path'], old['media_status']) or unique_id != old['media_unique_id']:
                 self.store.edit(row, old)
                 current = self.store.get(conn, chat, msg)
-                await notify(bot, self.cfg, connection['user_chat_id'], 'Сообщение изменено', current,
-                             f'Было: {escape(old["body"], 1000)}\nСтало: {escape(body, 1000)}')
+                await notify_edit(bot, connection['user_chat_id'], current, old['body'], body)
         else:
             self.store.save(row)
             if edited:
                 current = self.store.get(conn, chat, msg)
-                await notify(bot, self.cfg, connection['user_chat_id'], 'Сообщение изменено', current,
-                             f'Было: [нет старой версии]\nСтало: {escape(body, 1000)}')
+                await notify_edit(bot, connection['user_chat_id'], current, None, body)
         if not edited and not old and kind and expiring_hint(message):
             current = self.store.get(conn, chat, msg)
-            await notify(bot, self.cfg, connection['user_chat_id'], 'Исчезающее медиа', current,
-                         f'Текст: {escape(body, 1000)}', send_media=True)
+            await notify_media_event(bot, self.cfg, connection['user_chat_id'], current, deleted=False)
 
     async def save_reply(self, message: Message, bot: Bot, connection):
         reply = message.reply_to_message
         if not reply or not reply.from_user or reply.from_user.id == connection['owner_id']:
-            return
-        command = (message.text or message.caption or '').strip().lower()
-        if command not in {'/save', '.save', 'save', 'сохрани', '.сейв', '/сейв'} and not expiring_hint(reply):
             return
         if not extract_media(reply)[0]:
             return
@@ -328,29 +428,38 @@ class SaveBot:
         old = self.store.get(message.business_connection_id, reply.chat.id, reply.message_id)
         if old and (old['deleted'] or old['sender_id'] == connection['owner_id']):
             return
-        media = await download_media(bot, reply, self.cfg)
-        unique_id = getattr(extract_media(reply)[1], 'file_unique_id', None)
+        kind, media_obj = extract_media(reply)
+        unique_id = getattr(media_obj, 'file_unique_id', None)
+        if (old and unique_id and unique_id == old['media_unique_id'] and kind == old['media_type']
+                and old['media_path'] and Path(old['media_path']).is_file()):
+            media = (kind, old['media_path'], old['media_status'])
+        else:
+            media = await download_media(bot, reply, self.cfg)
         row = (message.business_connection_id, reply.chat.id, reply.message_id, reply.from_user.id,
                sender_name(reply), chat_name(reply), reply.text if reply.text is not None else reply.caption,
                *media, unique_id)
         self.store.save(row)
         current = self.store.get(message.business_connection_id, reply.chat.id, reply.message_id)
-        await notify(bot, self.cfg, connection['user_chat_id'], 'Медиа из ответа', current,
-                     f'Текст: {escape(current["body"], 1000)}', send_media=True)
+        await notify_media_event(bot, self.cfg, connection['user_chat_id'], current, deleted=False)
 
     async def deleted(self, deleted: BusinessMessagesDeleted, bot: Bot):
         connection = await self.allowed(bot, deleted.business_connection_id)
         if not connection:
             return
+        groups = {}
         for msg_id in deleted.message_ids:
             row = self.store.get(deleted.business_connection_id, deleted.chat.id, msg_id)
             if not row or row['deleted']:
                 continue
             self.store.mark_deleted(deleted.business_connection_id, deleted.chat.id, msg_id)
-            if row['sender_id'] == connection['owner_id']:
-                continue
-            await notify(bot, self.cfg, connection['user_chat_id'], 'Сообщение удалено', row,
-                         f'Текст: {escape(row["body"], 2000)}', send_media=True)
+            if row['sender_id'] != connection['owner_id']:
+                groups.setdefault(row['sender_id'], []).append(row)
+        for rows in groups.values():
+            if len(rows) == 1:
+                await notify_media_event(bot, self.cfg, connection['user_chat_id'], rows[0], deleted=True)
+            else:
+                await notify_deleted_group(bot, self.cfg, connection['user_chat_id'], rows)
+
 
 
 def build_dispatcher(app: SaveBot) -> Dispatcher:
