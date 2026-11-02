@@ -242,6 +242,7 @@ async def test_media_and_replies_use_correct_business_owner(setup):
 def test_config_does_not_require_owner_id(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv('BOT_TOKEN', 'test-token')
+    monkeypatch.setenv('WEBHOOK_BASE_URL', 'https://example.com')
     monkeypatch.delenv('OWNER_TELEGRAM_ID', raising=False)
     assert Config.from_env().token == 'test-token'
 

@@ -2,18 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import json
+import signal
 import html
 import logging
 import os
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
+from urllib.parse import urlsplit
+
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import BusinessConnection, BusinessMessagesDeleted, FSInputFile, Message
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (BotCommand, BusinessConnection, BusinessMessagesDeleted, CallbackQuery,
+                           FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message)
+from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
 log = logging.getLogger(__name__)
@@ -25,6 +33,9 @@ class Config:
     database: Path
     media_dir: Path
     max_media_bytes: int
+    webhook_base_url: str = ''
+    webhook_host: str = '0.0.0.0'
+    webhook_port: int = 8080
 
     @classmethod
     def from_env(cls) -> Config:
@@ -42,7 +53,21 @@ class Config:
         max_mb = int(os.getenv('MAX_MEDIA_SIZE_MB', os.getenv('SAVE_MEDIA_MAX_MB', '50')))
         if max_mb <= 0:
             raise ValueError('MAX_MEDIA_SIZE_MB должен быть больше 0')
-        return cls(token, Path(database), Path(os.getenv('MEDIA_DIR', 'data/media')), max_mb * 1024 * 1024)
+        base = os.getenv('WEBHOOK_BASE_URL', '').strip().rstrip('/')
+        parsed = urlsplit(base)
+        if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+                or parsed.query or parsed.fragment or not re.fullmatch(r'/[A-Za-z0-9/_~.-]*|', parsed.path)
+                or '//' in parsed.path):
+            raise ValueError('Укажите публичный HTTPS-адрес WEBHOOK_BASE_URL без параметров и фрагмента')
+        try:
+            port = int(os.getenv('WEBHOOK_PORT', '8080'))
+            if not 1 <= port <= 65535:
+                raise ValueError
+            parsed.port  # Validate the optional public port too.
+        except ValueError:
+            raise ValueError('Некорректный порт вебхука') from None
+        return cls(token, Path(database), Path(os.getenv('MEDIA_DIR', 'data/media')),
+                   max_mb * 1024 * 1024, base, os.getenv('WEBHOOK_HOST', '0.0.0.0'), port)
 
 
 class Store:
@@ -53,6 +78,14 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.executescript('''
+            CREATE TABLE IF NOT EXISTS webhook_updates (
+                update_id INTEGER PRIMARY KEY, processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS mirrors (
+                bot_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL,
+                username TEXT NOT NULL, token_encrypted BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS mirrors_by_owner ON mirrors(owner_id);
             CREATE TABLE IF NOT EXISTS save_connections (
                 connection_id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, enabled INTEGER NOT NULL,
                 user_chat_id INTEGER
@@ -373,9 +406,6 @@ class SaveBot:
         else:
             await bot.send_message(connection.user_chat_id, 'Business Mode отключён.')
 
-    async def start(self, message: Message):
-        await message.answer('Save Mode работает. Подключите бота в настройках Telegram Business.')
-
     async def message(self, message: Message, bot: Bot, edited=False):
         connection = await self.allowed(bot, message.business_connection_id)
         if not connection:
@@ -462,7 +492,479 @@ class SaveBot:
 
 
 
-def build_dispatcher(app: SaveBot) -> Dispatcher:
+UPDATES = ['message', 'callback_query', 'business_connection', 'business_message',
+           'edited_business_message', 'deleted_business_messages']
+
+
+async def setup_commands(bot):
+    try:
+        await bot.set_my_commands([BotCommand(command='start', description='Приветствие'),
+                                   BotCommand(command='mirrors', description='Управление зеркалами')])
+    except Exception:
+        log.warning('Не удалось установить меню команд бота')
+
+
+class MirrorError(Exception):
+    """A safe error message which never contains a bot token."""
+
+
+@dataclass
+class WebhookEndpoint:
+    bot: Bot
+    dispatcher: Dispatcher
+    secret: str
+    url: str
+    store: Store | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class WebhookServer:
+    """One authenticated route per bot; bot tokens are never included in URLs."""
+    def __init__(self, cfg: Config, key: bytes):
+        self.cfg = cfg
+        self.key = key
+        self.endpoints: dict[str, WebhookEndpoint] = {}
+        self.prefix = urlsplit(cfg.webhook_base_url).path.rstrip('/')
+        self.app = web.Application(client_max_size=5 * 1024 * 1024)
+        self.app.router.add_post(self.prefix + '/telegram/{route:[0-9a-f]{64}}', self.handle)
+        self.runner = None
+
+    def credentials(self, bot_id: int):
+        def derive(purpose):
+            return hmac.new(self.key, f'{purpose}:{bot_id}'.encode(), hashlib.sha256).hexdigest()
+        return derive('route'), derive('secret')
+
+    def url_for(self, bot_id: int):
+        route, _ = self.credentials(bot_id)
+        return f'{self.cfg.webhook_base_url}/telegram/{route}'
+
+    async def register(self, bot, dispatcher, store=None):
+        route, secret = self.credentials(bot.id)
+        if route in self.endpoints:
+            raise RuntimeError('Этот вебхук уже зарегистрирован')
+        endpoint = WebhookEndpoint(bot, dispatcher, secret, self.url_for(bot.id), store)
+        self.endpoints[route] = endpoint
+        try:
+            ok = await bot.set_webhook(url=endpoint.url, secret_token=secret, allowed_updates=UPDATES,
+                                       max_connections=1, drop_pending_updates=False)
+            if not ok:
+                raise RuntimeError('Telegram не подтвердил установку вебхука')
+        except BaseException:
+            self.endpoints.pop(route, None)
+            async with endpoint.lock:
+                pass
+            raise
+        return endpoint
+
+    async def detach(self, bot_id: int):
+        route, _ = self.credentials(bot_id)
+        endpoint = self.endpoints.pop(route, None)
+        if endpoint:
+            # Drain any in-flight update before closing its database and bot session.
+            async with endpoint.lock:
+                pass
+        return endpoint
+
+    async def handle(self, request):
+        route = request.match_info['route']
+        endpoint = self.endpoints.get(route)
+        if not endpoint:
+            return web.Response(status=404)
+        provided = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
+        if not hmac.compare_digest(provided.encode('utf-8'), endpoint.secret.encode('ascii')):
+            return web.Response(status=403)
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return web.Response(status=400)
+        if not isinstance(payload, dict) or not isinstance(payload.get('update_id'), int):
+            return web.Response(status=400)
+        async with endpoint.lock:
+            if self.endpoints.get(route) is not endpoint:
+                return web.Response(status=404)
+            if endpoint.store and endpoint.store.db.execute(
+                    'SELECT 1 FROM webhook_updates WHERE update_id=?', (payload['update_id'],)).fetchone():
+                return web.Response(status=200, text='OK')
+            try:
+                await endpoint.dispatcher.feed_raw_update(endpoint.bot, payload)
+                if endpoint.store:
+                    with endpoint.store.db:
+                        endpoint.store.db.execute('INSERT OR IGNORE INTO webhook_updates (update_id) VALUES (?)',
+                                                  (payload['update_id'],))
+                        if payload['update_id'] % 100 == 0:
+                            endpoint.store.db.execute("DELETE FROM webhook_updates WHERE processed_at < datetime('now', '-7 days')")
+            except Exception:
+                # Do not include request data or credentials in logs.
+                log.error('Ошибка обработки обновления вебхука для бота %s', endpoint.bot.id)
+                return web.Response(status=500)
+        return web.Response(status=200, text='OK')
+
+    async def start(self):
+        self.runner = web.AppRunner(self.app, access_log=None)
+        await self.runner.setup()
+        try:
+            await web.TCPSite(self.runner, self.cfg.webhook_host, self.cfg.webhook_port).start()
+        except BaseException:
+            await self.runner.cleanup()
+            self.runner = None
+            raise
+
+    async def stop(self):
+        if self.runner:
+            await self.runner.cleanup()
+            self.runner = None
+
+
+class MirrorManager:
+    def __init__(self, cfg: Config, store: Store, bot_factory=None, webhook_server=None):
+        self.cfg, self.store = cfg, store
+        self.bot_factory = bot_factory or Bot
+        self.running: dict[int, WebhookEndpoint] = {}
+        self.pending: set[tuple[int, int]] = set()
+        self.lock = asyncio.Lock()
+        self.background: set[asyncio.Task] = set()
+        key = self._load_key()
+        self.cipher = Fernet(key)
+        self.webhooks = webhook_server or WebhookServer(cfg, key)
+
+    def _load_key(self):
+        path = self.cfg.database.parent / 'mirror.key'
+        if path.exists():
+            return path.read_bytes().strip()
+        if self.store.db.execute('SELECT 1 FROM mirrors LIMIT 1').fetchone():
+            raise RuntimeError('Отсутствует mirror.key: восстановите ключ из резервной копии.')
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return path.read_bytes().strip()
+        key = Fernet.generate_key()
+        with os.fdopen(fd, 'wb') as output:
+            output.write(key + b'\n')
+        return key
+
+    def list_for(self, owner_id: int):
+        return self.store.db.execute('SELECT bot_id, username FROM mirrors WHERE owner_id=? ORDER BY bot_id',
+                                     (owner_id,)).fetchall()
+
+    async def _prepare(self, token: str):
+        bot = None
+        try:
+            bot = self.bot_factory(token)
+            me = await bot.get_me()
+            if not me.is_bot or not me.username:
+                raise MirrorError('Не удалось получить имя бота. Проверьте токен.')
+            return bot, me
+        except MirrorError:
+            if bot:
+                await bot.session.close()
+            raise
+        except Exception:
+            if bot:
+                await bot.session.close()
+            raise MirrorError('Не удалось проверить токен или подключиться к Telegram. Попробуйте ещё раз.') from None
+
+    async def _activate(self, bot, bot_id: int):
+        root = self.cfg.database.parent / 'mirrors' / str(bot_id)
+        cfg = Config(bot.token, root / 'app.db', root / 'media', self.cfg.max_media_bytes,
+                     self.cfg.webhook_base_url, self.cfg.webhook_host, self.cfg.webhook_port)
+        cfg.media_dir.mkdir(parents=True, exist_ok=True)
+        store = Store(cfg.database)
+        try:
+            await setup_commands(bot)
+            endpoint = await self.webhooks.register(bot, build_dispatcher(SaveBot(cfg, store), self), store)
+        except BaseException:
+            store.close()
+            raise
+        self.running[bot_id] = endpoint
+
+    async def add(self, owner_id: int, token: str, progress=None):
+        async def step(percent, text):
+            if progress:
+                await progress(percent, text)
+        await step(20, 'Проверяем токен...')
+        bot, me = await self._prepare(token)
+        try:
+            await step(40, 'Проверяем настройки бота...')
+            async with self.lock:
+                main_id = self.cfg.token.split(':', 1)[0]
+                if str(me.id) == main_id or self.store.db.execute('SELECT 1 FROM mirrors WHERE bot_id=?', (me.id,)).fetchone():
+                    raise MirrorError('Этот бот уже подключён. Используйте другой токен.')
+                await step(60, 'Сохраняем настройки...')
+                encrypted = self.cipher.encrypt(token.encode())
+                self.store.db.execute('INSERT INTO mirrors (bot_id, owner_id, username, token_encrypted) VALUES (?, ?, ?, ?)',
+                                      (me.id, owner_id, me.username, encrypted))
+                self.store.db.commit()
+                try:
+                    await step(80, 'Подключаем вебхук...')
+                    await self._activate(bot, me.id)
+                except BaseException:
+                    self.store.db.execute('DELETE FROM mirrors WHERE bot_id=?', (me.id,))
+                    self.store.db.commit()
+                    raise
+            return me
+        except MirrorError:
+            await bot.session.close()
+            raise
+        except Exception:
+            await bot.session.close()
+            raise MirrorError('Не удалось подключить вебхук. Проверьте настройки сервера и Telegram.') from None
+        except BaseException:
+            await bot.session.close()
+            raise
+
+    async def restore(self):
+        rows = self.store.db.execute('SELECT bot_id FROM mirrors ORDER BY bot_id').fetchall()
+        for saved in rows:
+            async with self.lock:
+                row = self.store.db.execute('SELECT * FROM mirrors WHERE bot_id=?', (saved['bot_id'],)).fetchone()
+                if not row or row['bot_id'] in self.running:
+                    continue
+                bot = None
+                try:
+                    token = self.cipher.decrypt(row['token_encrypted']).decode()
+                    bot, me = await self._prepare(token)
+                    if me.id != row['bot_id']:
+                        raise MirrorError('ID бота не совпадает.')
+                    await self._activate(bot, me.id)
+                except Exception:
+                    if bot:
+                        await bot.session.close()
+                    # Do not expose tokens, URLs or request details from Telegram errors.
+                    log.warning('Не удалось восстановить зеркало %s; оно осталось в списке', row['bot_id'])
+
+    async def remove(self, owner_id: int, bot_id: int):
+        async with self.lock:
+            row = self.store.db.execute('SELECT * FROM mirrors WHERE bot_id=? AND owner_id=?',
+                                        (bot_id, owner_id)).fetchone()
+            if not row:
+                return False, False
+            self.store.db.execute('DELETE FROM mirrors WHERE bot_id=? AND owner_id=?', (bot_id, owner_id))
+            self.store.db.commit()
+            endpoint = await self.webhooks.detach(bot_id)
+            self.running.pop(bot_id, None)
+        bot = endpoint.bot if endpoint else None
+        cleared = False
+        try:
+            if bot is None:
+                bot = self.bot_factory(self.cipher.decrypt(row['token_encrypted']).decode())
+            info = await bot.get_webhook_info()
+            if info.url == self.webhooks.url_for(bot_id):
+                cleared = bool(await bot.delete_webhook(drop_pending_updates=False))
+            else:
+                # Never remove a webhook installed by someone else.
+                cleared = True
+        except Exception:
+            log.warning('Не удалось отключить вебхук зеркала %s в Telegram', bot_id)
+        finally:
+            if endpoint and endpoint.store:
+                endpoint.store.close()
+            if bot:
+                await bot.session.close()
+        return True, cleared
+
+    def remove_later(self, owner_id: int, bot_id: int, reporting_bot=None, chat_id=None):
+        async def stop_and_report():
+            removed, cleared = await self.remove(owner_id, bot_id)
+            if reporting_bot and reporting_bot.id != bot_id:
+                try:
+                    if not removed:
+                        text = 'Зеркало уже удалено.'
+                    elif cleared:
+                        text = 'Зеркало остановлено и удалено. Список: /mirrors.'
+                    else:
+                        text = ('Зеркало остановлено, но не удалось отключить его вебхук в Telegram. '
+                                'Проверьте вебхук или отзовите токен в @BotFather.')
+                    await reporting_bot.send_message(chat_id, text)
+                except Exception:
+                    log.warning('Не удалось отправить результат удаления зеркала')
+        task = asyncio.create_task(stop_and_report())
+        self.background.add(task)
+        task.add_done_callback(self.background.discard)
+
+    async def shutdown(self):
+        if self.background:
+            await asyncio.gather(*self.background, return_exceptions=True)
+        for bot_id in list(self.running):
+            endpoint = await self.webhooks.detach(bot_id)
+            self.running.pop(bot_id, None)
+            if endpoint:
+                if endpoint.store:
+                    endpoint.store.close()
+                await endpoint.bot.session.close()
+
+
+WELCOME = ('<b>Добро пожаловать!</b>\n\n'
+           '<b>KLsave</b> — твой бот, который поможет в самых неожиданных моментах.\n\n'
+           '<b>— Что он делает?</b>\n'
+           'Сохраняет доступные медиа, сообщает об удалении и показывает изменения сообщений.')
+
+
+def navigation(*buttons):
+    return InlineKeyboardMarkup(inline_keyboard=[list(buttons)])
+
+
+def button(text, data):
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+class Menu:
+    def __init__(self, mirrors: MirrorManager):
+        self.manager = mirrors
+
+    async def show_page(self, bot, chat_id: int, page: int):
+        if page == 0:
+            text = WELCOME
+            keyboard = navigation(button('Листать далее ›', 'menu:page:1'))
+        elif page == 1:
+            me = await bot.get_me()
+            username = html.escape('@' + me.username) if me.username else 'юзернейм бота'
+            text = (f'<b>Автоматизация чатов</b>\n\n'
+                    '<blockquote>Подключи бота через раздел <b>«Автоматизация чатов»</b> в профиле. '
+                    'Доступность функции зависит от аккаунта и настроек Telegram.</blockquote>\n\n'
+                    '<b>Как подключить:</b>\n\n'
+                    '<blockquote><b>1.</b> Перейди в свой профиль</blockquote>\n\n'
+                    '<blockquote><b>2.</b> Нажми «Изменить»</blockquote>\n\n'
+                    '<blockquote><b>3.</b> Найди вкладку «Автоматизация чатов»</blockquote>\n\n'
+                    f'<blockquote><b>4.</b> Вставь юзернейм бота — <code>{username}</code></blockquote>\n\n'
+                    '<blockquote>• Выбери чаты: «Все личные, кроме…» или «Только выбранные»\n'
+                    '• Включи <b>«Управление сообщениями»</b> в разрешениях</blockquote>\n\n'
+                    '<b>Жми кнопку ниже, чтобы продолжить.</b>')
+            keyboard = navigation(button('‹ Вернуться назад', 'menu:page:0'), button('Листать далее ›', 'menu:page:2'))
+        else:
+            text = ('<b>Хочешь полный контроль?</b>\n\n'
+                    'Теперь ты можешь создать своё «зеркало» на базе KLSave и управлять им по своим правилам.\n\n'
+                    '<b>Что даёт зеркало:</b>\n'
+                    '<blockquote>• Отдельный бот и собственное подключение к Telegram Business\n'
+                    '• Собственное хранилище сообщений и медиа\n'
+                    '• Управление запуском через /mirrors</blockquote>\n\n'
+                    '<i>«Ты управляешь — мы помогаем.»</i>')
+            keyboard = navigation(button('‹ Вернуться назад', 'menu:page:1'), button('Мои зеркала', 'menu:list:0'))
+        await bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='HTML')
+
+    async def start(self, message: Message, bot: Bot):
+        self.manager.pending.discard((bot.id, message.from_user.id))
+        await self.show_page(bot, message.chat.id, 0)
+
+    async def mirrors(self, message: Message, bot: Bot):
+        self.manager.pending.discard((bot.id, message.from_user.id))
+        if not self.manager.list_for(message.from_user.id):
+            await self.prompt(bot, message.chat.id, message.from_user.id)
+        else:
+            await self.show_mirrors(bot, message.chat.id, message.from_user.id, 0)
+
+    async def show_mirrors(self, bot, chat_id: int, owner_id: int, page: int):
+        mirrors = self.manager.list_for(owner_id)
+        pages = max(1, (len(mirrors) + 9) // 10)
+        page = max(0, min(page, pages - 1))
+        selected = mirrors[page * 10:page * 10 + 10]
+        text = '<b>Мои зеркала</b>\n\n'
+        if not mirrors:
+            text += 'У тебя пока нет зеркал.'
+        else:
+            lines = []
+            for row in selected:
+                status = 'подключено' if row['bot_id'] in self.manager.running else 'остановлено'
+                lines.append(f'@{html.escape(row["username"])} — {status}')
+            text += '\n'.join(lines) + f'\n\nСтраница {page + 1}/{pages}'
+        buttons = [[button(f'Удалить @{row["username"]}', f'menu:delete:{row["bot_id"]}')]
+                   for row in selected]
+        paging = []
+        if page:
+            paging.append(button('‹ Назад', f'menu:list:{page - 1}'))
+        if page + 1 < pages:
+            paging.append(button('Далее ›', f'menu:list:{page + 1}'))
+        if paging:
+            buttons.append(paging)
+        buttons.append([button('➕ Добавить зеркало', 'menu:add')])
+        await bot.send_message(chat_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode='HTML')
+
+    async def prompt(self, bot, chat_id: int, user_id: int):
+        self.manager.pending.add((bot.id, user_id))
+        await bot.send_message(chat_id,
+            'Введите токен от @BotFather в формате: <code>12345:ABCDE</code>\n\n'
+            'Токен — секрет: он попадёт оператору этого бота. Отправляйте его только если доверяете серверу. Существующий вебхук зеркала будет заменён.',
+            parse_mode='HTML', reply_markup=navigation(button('Назад', 'menu:cancel')))
+
+    async def callback(self, query: CallbackQuery, bot: Bot):
+        message = query.message
+        if not message or message.chat.type != 'private' or message.chat.id != query.from_user.id:
+            await query.answer('Откройте бота в личном чате.', show_alert=True)
+            return
+        user_id, chat_id = query.from_user.id, message.chat.id
+        data = query.data or ''
+        await query.answer()
+        if data.startswith('menu:delete:'):
+            try:
+                bot_id = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            # Authorize before deleting any mirror; run after the acknowledgement so
+            # a mirror can remove itself without cancelling its callback mid-response.
+            row = self.manager.store.db.execute('SELECT 1 FROM mirrors WHERE bot_id=? AND owner_id=?',
+                                                (bot_id, user_id)).fetchone()
+            if not row:
+                await bot.send_message(chat_id, 'Зеркало не найдено или принадлежит другому пользователю.')
+                return
+            await bot.delete_message(chat_id, message.message_id)
+            await bot.send_message(chat_id, 'Зеркало удаляется и будет остановлено. Проверить список: /mirrors.')
+            # Defer all removals until after callbacks return, avoiding cross-bot lock deadlocks.
+            self.manager.remove_later(user_id, bot_id, bot, chat_id)
+            return
+        await bot.delete_message(chat_id, message.message_id)
+        if data == 'menu:cancel':
+            self.manager.pending.discard((bot.id, user_id))
+            return
+        if data == 'menu:add':
+            await self.prompt(bot, chat_id, user_id)
+        elif data.startswith('menu:page:'):
+            self.manager.pending.discard((bot.id, user_id))
+            try:
+                page = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            if 0 <= page <= 2:
+                await self.show_page(bot, chat_id, page)
+        elif data.startswith('menu:list:'):
+            try:
+                page = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            self.manager.pending.discard((bot.id, user_id))
+            await self.show_mirrors(bot, chat_id, user_id, page)
+
+    async def receive_token(self, message: Message, bot: Bot):
+        if not message.from_user or (bot.id, message.from_user.id) not in self.manager.pending:
+            return
+        # Only private input is accepted; never echo or log the supplied token.
+        token = (message.text or '').strip()
+        try:
+            await bot.delete_message(message.chat.id, message.message_id)
+        except Exception:
+            await bot.send_message(message.chat.id, 'Не удалось удалить сообщение с токеном. Удалите его вручную.')
+        if not token:
+            await bot.send_message(message.chat.id, 'Отправьте токен текстом или нажмите «Назад».')
+            return
+        status = await bot.send_message(message.chat.id, '0% Подготавливаем подключение... ▢▢▢▢▢')
+        async def progress(percent, text):
+            blocks = '■' * (percent // 20) + '▢' * (5 - percent // 20)
+            try:
+                await bot.edit_message_text(f'{percent}% {text} {blocks}', chat_id=message.chat.id,
+                                            message_id=status.message_id)
+            except Exception:
+                log.warning('Не удалось обновить индикатор зеркала')
+        try:
+            me = await self.manager.add(message.from_user.id, token, progress)
+        except MirrorError as exc:
+            await bot.edit_message_text(f'Не удалось добавить зеркало: {html.escape(str(exc))}',
+                                        chat_id=message.chat.id, message_id=status.message_id, parse_mode='HTML')
+            return
+        self.manager.pending.discard((bot.id, message.from_user.id))
+        await progress(100, 'Зеркало запущено!')
+        await bot.send_message(message.chat.id, f'Зеркало @{html.escape(me.username)} добавлено. '
+                               'Управление доступно через /mirrors. Для получения сообщений включите Business Mode для зеркала в @BotFather.', parse_mode='HTML')
+
+
+def build_dispatcher(app: SaveBot, mirrors=None) -> Dispatcher:
     dp = Dispatcher()
     dp.business_connection.register(app.connection)
     dp.business_message.register(app.message)
@@ -470,7 +972,12 @@ def build_dispatcher(app: SaveBot) -> Dispatcher:
         await app.message(message, bot, edited=True)
     dp.edited_business_message.register(edited)
     dp.deleted_business_messages.register(app.deleted)
-    dp.message.register(app.start, CommandStart(), F.chat.type == 'private')
+    if mirrors is not None:
+        menu = Menu(mirrors)
+        dp.message.register(menu.start, CommandStart(), F.chat.type == 'private')
+        dp.message.register(menu.mirrors, Command('mirrors'), F.chat.type == 'private')
+        dp.callback_query.register(menu.callback, F.data.startswith('menu:'))
+        dp.message.register(menu.receive_token, F.chat.type == 'private')
     return dp
 
 
@@ -480,12 +987,35 @@ async def main():
     cfg.media_dir.mkdir(parents=True, exist_ok=True)
     store = Store(cfg.database)
     bot = Bot(cfg.token)
+    mirrors = None
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    installed_signals = []
     try:
-        dp = build_dispatcher(SaveBot(cfg, store))
-        # Ordered handling prevents edits/deletes racing with media downloads and saves.
-        await dp.start_polling(bot, handle_as_tasks=False, allowed_updates=[
-            'message', 'business_connection', 'business_message', 'edited_business_message', 'deleted_business_messages'])
+        mirrors = MirrorManager(cfg, store)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+                installed_signals.append(sig)
+            except (NotImplementedError, RuntimeError):
+                pass
+        await mirrors.webhooks.start()
+        await setup_commands(bot)
+        dp = build_dispatcher(SaveBot(cfg, store), mirrors)
+        try:
+            await mirrors.webhooks.register(bot, dp, store)
+        except Exception:
+            raise RuntimeError('Не удалось зарегистрировать вебхук основного бота. Проверьте настройки и доступность Telegram.') from None
+        await mirrors.restore()
+        log.info('Сервер вебхуков запущен на порту %s', cfg.webhook_port)
+        await stop.wait()
     finally:
+        if mirrors:
+            await mirrors.webhooks.stop()
+            await mirrors.shutdown()
+            await mirrors.webhooks.detach(bot.id)
+        for sig in installed_signals:
+            loop.remove_signal_handler(sig)
         store.close()
         await bot.session.close()
 

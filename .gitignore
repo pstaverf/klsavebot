@@ -37,3 +37,6 @@ logs/
 _refs/
 .idea/
 .vscode/
+
+# Encryption key for mirror bot tokens (also for custom database paths)
+mirror.key

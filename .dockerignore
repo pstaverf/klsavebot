@@ -13,3 +13,4 @@ venv
 *.sqlite
 *.session
 *.log
+mirror.key
