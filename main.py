@@ -18,7 +18,9 @@ from urllib.parse import urlsplit
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
+from aiogram.filters.command import CommandObject
 from aiogram.types import (BotCommand, BusinessConnection, BusinessMessagesDeleted, CallbackQuery,
                            FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message)
 from cryptography.fernet import Fernet
@@ -78,6 +80,9 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.executescript('''
+            CREATE TABLE IF NOT EXISTS mailing_users (
+                chat_id INTEGER PRIMARY KEY, last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS webhook_updates (
                 update_id INTEGER PRIMARY KEY, processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -126,6 +131,18 @@ class Store:
                       AND sender_id IS NOT NULL AND direction='incoming' ''')
         # Connections are verified through Telegram instead of trusting historical credentials.
         self.db.execute("INSERT INTO save_meta VALUES ('legacy_imported')")
+
+    def remember_mailing_user(self, chat_id: int):
+        self.db.execute('''INSERT INTO mailing_users (chat_id) VALUES (?)
+            ON CONFLICT(chat_id) DO UPDATE SET last_seen=CURRENT_TIMESTAMP''', (chat_id,))
+        self.db.commit()
+
+    def mailing_recipients(self):
+        return [row[0] for row in self.db.execute('SELECT chat_id FROM mailing_users ORDER BY chat_id')]
+
+    def forget_mailing_user(self, chat_id: int):
+        self.db.execute('DELETE FROM mailing_users WHERE chat_id=?', (chat_id,))
+        self.db.commit()
 
     def connection(self, connection_id: str):
         return self.db.execute('SELECT * FROM save_connections WHERE connection_id=?', (connection_id,)).fetchone()
@@ -196,19 +213,37 @@ def extract_media(message: Message):
     return None, None
 
 
-def expiring_hint(message: Message) -> bool:
-    # Spoilers are not necessarily expiring, but proactively save them as before.
-    if message.has_media_spoiler:
-        return True
+def is_expiring_media(message: Message) -> bool:
+    """Only classify a media message as expiring when Telegram supplies an explicit hint."""
     raw = message.model_dump(exclude_none=True)
-    def find(value):
-        if isinstance(value, dict):
-            return any((any(k in str(key).lower() for k in ('ttl', 'self_destruct', 'view_once', 'expire')) and bool(item))
-                       or find(item) for key, item in value.items())
-        if isinstance(value, (list, tuple)):
-            return any(find(item) for item in value)
+    fields = {'ttl', 'ttl_seconds', 'ttl_period', 'self_destruct', 'self_destruct_time',
+              'self_destruct_seconds', 'is_self_destructing', 'view_once', 'is_view_once'}
+
+    def enabled(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value > 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return normalized == 'true' or (normalized.isdecimal() and int(normalized) > 0)
         return False
-    return find(raw)
+
+    # Check only this message and its own media; a replied-to or forwarded message
+    # can have different expiration metadata. A spoiler alone is not view-once.
+    candidates = [raw]
+    for name in ('photo', 'video', 'video_note', 'voice', 'audio', 'animation', 'document'):
+        media = raw.get(name)
+        if isinstance(media, dict):
+            candidates.append(media)
+        elif isinstance(media, list):
+            candidates.extend(item for item in media if isinstance(item, dict))
+    return any(enabled(data.get(field)) for data in candidates for field in fields)
+
+
+def expiring_hint(message: Message) -> bool:
+    # Preserve proactive spoiler saving without classifying spoilers as view-once.
+    return bool(message.has_media_spoiler or is_expiring_media(message))
 
 
 async def download_media(bot: Bot, message: Message, cfg: Config):
@@ -249,6 +284,38 @@ def escape(value, limit=1000):
     return html.escape(str(value or '—')[:limit])
 
 
+# Custom emoji can be unavailable to some bots; fall back to their plain equivalents.
+EMOJI_EDIT = '<tg-emoji emoji-id="5879841310902324730">✏️</tg-emoji>'
+EMOJI_DELETE = '<tg-emoji emoji-id="5841541824803509441">🗑</tg-emoji>'
+EMOJI_EXPIRING = '<tg-emoji emoji-id="5798535677318533269">⏲</tg-emoji>'
+EMOJI_WARNING = '<tg-emoji emoji-id="5881702736843511327">⚠️</tg-emoji>'
+EMOJI_WELCOME = '<tg-emoji emoji-id="5906995262378741881">🙋</tg-emoji>'
+EMOJI_MAILING = '<tg-emoji emoji-id="5771695636411847302">📢</tg-emoji>'
+MAILING_ADMIN_ID = 6025818386
+
+
+def plain_emojis(text: str) -> str:
+    return re.sub(r'<tg-emoji emoji-id="[0-9]+">(.*?)</tg-emoji>', r'\1', text)
+
+
+async def send_html(bot, chat_id: int, text: str, **kwargs):
+    try:
+        return await bot.send_message(chat_id, text, parse_mode='HTML', **kwargs)
+    except TelegramBadRequest:
+        if '<tg-emoji ' not in text:
+            raise
+        return await bot.send_message(chat_id, plain_emojis(text), parse_mode='HTML', **kwargs)
+
+
+async def send_html_media(method, chat_id: int, file, caption: str):
+    try:
+        return await method(chat_id, file, caption=caption, parse_mode='HTML')
+    except TelegramBadRequest:
+        if '<tg-emoji ' not in caption:
+            raise
+        return await method(chat_id, file, caption=plain_emojis(caption), parse_mode='HTML')
+
+
 FOOTER = '<b>Этот бот KLSave.</b> Максимум функций и меньше ограничений по функционалу.'
 
 
@@ -261,14 +328,14 @@ def sender_link(row) -> str:
 
 
 async def notify_edit(bot: Bot, user_chat_id: int, row, old_body, new_body):
-    text = (f'<b>Сообщение было изменено!</b>\n\n'
+    text = (f'{EMOJI_EDIT} <b>Сообщение было изменено!</b>\n\n'
             f'{sender_link(row)} отредактировал(-а) своё сообщение (#m{row["message_id"]}):\n\n'
             f'Было: {escape(old_body if old_body is not None else "[нет старой версии]", 800)}\n'
             f'Стало: {escape(new_body, 800)}\n\n{FOOTER}')
-    await bot.send_message(user_chat_id, text, parse_mode='HTML')
+    await send_html(bot, user_chat_id, text)
 
 
-def event_text(row, *, deleted: bool, media_caption: bool = False, unavailable: bool = False, upload_failed: bool = False) -> str:
+def event_text(row, *, deleted: bool, media_caption: bool = False, unavailable: bool = False, upload_failed: bool = False, is_expiring: bool = False) -> str:
     """Format the owner-facing notification, keeping captions below Telegram's limit."""
     name = sender_link(row)
     message_id = row['message_id']
@@ -276,7 +343,7 @@ def event_text(row, *, deleted: bool, media_caption: bool = False, unavailable: 
     limit = 250 if media_caption else 1500
     body = html.escape(value[:limit] + ('…' if len(value) > limit else ''))
     if deleted:
-        text = (f'<b>Сообщение было удалено!</b>\n\n'
+        text = (f'{EMOJI_DELETE} <b>Сообщение было удалено!</b>\n\n'
                 f'{name} удалил(-а) своё сообщение (#m{message_id}):\n\n')
         if row['media_type']:
             text += f'Тип сообщения: {escape(row["media_type"], 50)}'
@@ -285,30 +352,32 @@ def event_text(row, *, deleted: bool, media_caption: bool = False, unavailable: 
         else:
             text += f'<blockquote>Message: {body}</blockquote>'
     else:
-        text = (f'<b>Исчезающее медиа!</b>\n\n'
+        title = 'Исчезающее медиа!' if is_expiring else 'Медиа из сообщения!'
+        marker = f'{EMOJI_EXPIRING} ' if is_expiring else ''
+        text = (f'{marker}<b>{title}</b>\n\n'
                 f'{name} отправил(-а) своё сообщение (#m{message_id}):\n\n'
                 f'Message: {body}')
     if upload_failed:
-        text += '\n\nМедиа недоступно: не удалось отправить файл.'
+        text += f'\n\n{EMOJI_WARNING} Медиа недоступно: не удалось отправить файл.'
     elif unavailable:
-        text += f'\n\nМедиа недоступно: {escape(row["media_status"] or "unavailable", 50)}'
+        text += f'\n\n{EMOJI_WARNING} Медиа недоступно: {escape(row["media_status"] or "unavailable", 50)}'
     return f'{text}\n\n{FOOTER}'
 
 
-async def notify_media_event(bot: Bot, cfg: Config, user_chat_id: int, row, *, deleted: bool):
+async def notify_media_event(bot: Bot, cfg: Config, user_chat_id: int, row, *, deleted: bool, is_expiring: bool = False):
     """Use captions when supported; circles and stickers follow the text separately."""
     kind = row['media_type']
     path = row['media_path']
     candidate = Path(path).resolve() if path else None
     exists = bool(candidate and candidate.is_relative_to(cfg.media_dir.resolve()) and candidate.is_file())
     if not kind or not exists:
-        await bot.send_message(user_chat_id, event_text(row, deleted=deleted, unavailable=bool(kind)), parse_mode='HTML')
+        await send_html(bot, user_chat_id, event_text(row, deleted=deleted, unavailable=bool(kind), is_expiring=is_expiring))
         return
 
     text_first = kind in {'video_note', 'sticker'}
-    text = event_text(row, deleted=deleted, media_caption=not text_first)
+    text = event_text(row, deleted=deleted, media_caption=not text_first, is_expiring=is_expiring)
     if text_first:
-        await bot.send_message(user_chat_id, text, parse_mode='HTML')
+        await send_html(bot, user_chat_id, text)
         try:
             method = bot.send_video_note if kind == 'video_note' else bot.send_sticker
             await method(user_chat_id, FSInputFile(candidate))
@@ -320,10 +389,10 @@ async def notify_media_event(bot: Bot, cfg: Config, user_chat_id: int, row, *, d
     try:
         method = {'photo': bot.send_photo, 'video': bot.send_video, 'animation': bot.send_animation,
                   'voice': bot.send_voice, 'audio': bot.send_audio}.get(kind, bot.send_document)
-        await method(user_chat_id, FSInputFile(candidate), caption=text, parse_mode='HTML')
+        await send_html_media(method, user_chat_id, FSInputFile(candidate), text)
     except Exception:
         log.exception('Не удалось отправить сохранённое медиа')
-        await bot.send_message(user_chat_id, event_text(row, deleted=deleted, upload_failed=True), parse_mode='HTML')
+        await send_html(bot, user_chat_id, event_text(row, deleted=deleted, upload_failed=True, is_expiring=is_expiring))
 
 
 def deleted_group_text(rows) -> str:
@@ -334,7 +403,7 @@ def deleted_group_text(rows) -> str:
         shortened = value[:400] + ('…' if len(value) > 400 else '')
         lines.append(f'#m{row["message_id"]}: {html.escape(shortened)}')
     entries = '\n'.join(lines)
-    return (f'<b>Были удалены сообщения!</b>\n\n'
+    return (f'{EMOJI_DELETE} <b>Были удалены сообщения!</b>\n\n'
             f'{sender_link(rows[0])} удалил(-а) несколько своих сообщений ({ids}):\n\n'
             f'Message: {entries}\n\n{FOOTER}')
 
@@ -353,7 +422,7 @@ async def notify_deleted_group(bot: Bot, cfg: Config, user_chat_id: int, rows):
     if batch:
         batches.append(batch)
     for batch in batches:
-        await bot.send_message(user_chat_id, deleted_group_text(batch), parse_mode='HTML')
+        await send_html(bot, user_chat_id, deleted_group_text(batch))
         for row in batch:
             kind, path = row['media_type'], row['media_path']
             if not kind:
@@ -401,8 +470,8 @@ class SaveBot:
         if connection.is_enabled:
             text = ('<b>Business Mode активирован!</b>\n'
                     '<i>Ты включил(-а) бизнес-режим для KLSave — теперь бот готов принимать сообщения и работать в полном объёме.\n'
-                    'Обрати внимание: данный бот может быть удален из-за правил Telegram, следи за новостями в нашем канале для получения зеркал.</i>')
-            await bot.send_message(connection.user_chat_id, text, parse_mode='HTML')
+                    f'{EMOJI_WARNING} Обрати внимание: данный бот может быть удален из-за правил Telegram, следи за новостями в нашем канале для получения зеркал.</i>')
+            await send_html(bot, connection.user_chat_id, text)
         else:
             await bot.send_message(connection.user_chat_id, 'Business Mode отключён.')
 
@@ -446,7 +515,8 @@ class SaveBot:
                 await notify_edit(bot, connection['user_chat_id'], current, None, body)
         if not edited and not old and kind and expiring_hint(message):
             current = self.store.get(conn, chat, msg)
-            await notify_media_event(bot, self.cfg, connection['user_chat_id'], current, deleted=False)
+            await notify_media_event(bot, self.cfg, connection['user_chat_id'], current,
+                                     deleted=False, is_expiring=is_expiring_media(message))
 
     async def save_reply(self, message: Message, bot: Bot, connection):
         reply = message.reply_to_message
@@ -470,7 +540,8 @@ class SaveBot:
                *media, unique_id)
         self.store.save(row)
         current = self.store.get(message.business_connection_id, reply.chat.id, reply.message_id)
-        await notify_media_event(bot, self.cfg, connection['user_chat_id'], current, deleted=False)
+        await notify_media_event(bot, self.cfg, connection['user_chat_id'], current,
+                                 deleted=False, is_expiring=is_expiring_media(reply))
 
     async def deleted(self, deleted: BusinessMessagesDeleted, bot: Bot):
         connection = await self.allowed(bot, deleted.business_connection_id)
@@ -499,7 +570,8 @@ UPDATES = ['message', 'callback_query', 'business_connection', 'business_message
 async def setup_commands(bot):
     try:
         await bot.set_my_commands([BotCommand(command='start', description='Приветствие'),
-                                   BotCommand(command='mirrors', description='Управление зеркалами')])
+                                   BotCommand(command='mirrors', description='Управление зеркалами'),
+                                   BotCommand(command='mailing', description='Рассылка (для владельца)')])
     except Exception:
         log.warning('Не удалось установить меню команд бота')
 
@@ -623,6 +695,7 @@ class MirrorManager:
         self.pending: set[tuple[int, int]] = set()
         self.lock = asyncio.Lock()
         self.background: set[asyncio.Task] = set()
+        self.mailings: dict[int, asyncio.Task] = {}
         key = self._load_key()
         self.cipher = Fernet(key)
         self.webhooks = webhook_server or WebhookServer(cfg, key)
@@ -732,6 +805,60 @@ class MirrorManager:
                     # Do not expose tokens, URLs or request details from Telegram errors.
                     log.warning('Не удалось восстановить зеркало %s; оно осталось в списке', row['bot_id'])
 
+    def start_mailing(self, bot, store: Store, recipients: list[int], text: str):
+        existing = self.mailings.get(bot.id)
+        if existing and not existing.done():
+            return False
+        task = asyncio.create_task(self._mailing(bot, store, recipients, text))
+        self.mailings[bot.id] = task
+        def cleanup(done):
+            if self.mailings.get(bot.id) is done:
+                self.mailings.pop(bot.id, None)
+        task.add_done_callback(cleanup)
+        return True
+
+    async def _mailing(self, bot, store: Store, recipients: list[int], text: str):
+        body = f'{EMOJI_MAILING} <b>Рассылка</b>\n\n{html.escape(text)}'
+        delivered = failed = 0
+        for chat_id in recipients:
+            for attempt in range(3):
+                try:
+                    await send_html(bot, chat_id, body)
+                    delivered += 1
+                    break
+                except TelegramRetryAfter as exc:
+                    # Respect the cooldown even after the last attempt before moving on.
+                    await asyncio.sleep(max(0.1, float(exc.retry_after)))
+                    if attempt == 2:
+                        failed += 1
+                        break
+                except TelegramForbiddenError:
+                    store.forget_mailing_user(chat_id)
+                    failed += 1
+                    break
+                except TelegramBadRequest as exc:
+                    if 'chat not found' in str(exc).lower() or 'user is deactivated' in str(exc).lower():
+                        store.forget_mailing_user(chat_id)
+                    failed += 1
+                    break
+                except Exception:
+                    # Never log the broadcast text or the bot token.
+                    failed += 1
+                    break
+            # Leave headroom for other bot notifications and respect Telegram flood limits.
+            await asyncio.sleep(0.05)
+        try:
+            await bot.send_message(MAILING_ADMIN_ID,
+                f'Рассылка завершена. Доставлено: {delivered}; не доставлено: {failed}.')
+        except Exception:
+            log.warning('Не удалось отправить владельцу результат рассылки')
+
+    async def stop_mailing(self, bot_id: int):
+        task = self.mailings.pop(bot_id, None)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def remove(self, owner_id: int, bot_id: int):
         async with self.lock:
             row = self.store.db.execute('SELECT * FROM mirrors WHERE bot_id=? AND owner_id=?',
@@ -742,6 +869,7 @@ class MirrorManager:
             self.store.db.commit()
             endpoint = await self.webhooks.detach(bot_id)
             self.running.pop(bot_id, None)
+        await self.stop_mailing(bot_id)
         bot = endpoint.bot if endpoint else None
         cleared = False
         try:
@@ -782,6 +910,8 @@ class MirrorManager:
         task.add_done_callback(self.background.discard)
 
     async def shutdown(self):
+        for bot_id in list(self.mailings):
+            await self.stop_mailing(bot_id)
         if self.background:
             await asyncio.gather(*self.background, return_exceptions=True)
         for bot_id in list(self.running):
@@ -793,7 +923,7 @@ class MirrorManager:
                 await endpoint.bot.session.close()
 
 
-WELCOME = ('<b>Добро пожаловать!</b>\n\n'
+WELCOME = (f'{EMOJI_WELCOME} <b>Добро пожаловать!</b>\n\n'
            '<b>KLsave</b> — твой бот, который поможет в самых неожиданных моментах.\n\n'
            '<b>— Что он делает?</b>\n'
            'Сохраняет доступные медиа, сообщает об удалении и показывает изменения сообщений.')
@@ -808,8 +938,9 @@ def button(text, data):
 
 
 class Menu:
-    def __init__(self, mirrors: MirrorManager):
+    def __init__(self, mirrors: MirrorManager, store: Store | None = None):
         self.manager = mirrors
+        self.store = store or mirrors.store
 
     async def show_page(self, bot, chat_id: int, page: int):
         if page == 0:
@@ -839,7 +970,7 @@ class Menu:
                     '• Управление запуском через /mirrors</blockquote>\n\n'
                     '<i>«Ты управляешь — мы помогаем.»</i>')
             keyboard = navigation(button('‹ Вернуться назад', 'menu:page:1'), button('Мои зеркала', 'menu:list:0'))
-        await bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='HTML')
+        await send_html(bot, chat_id, text, reply_markup=keyboard)
 
     async def start(self, message: Message, bot: Bot):
         self.manager.pending.discard((bot.id, message.from_user.id))
@@ -851,6 +982,29 @@ class Menu:
             await self.prompt(bot, message.chat.id, message.from_user.id)
         else:
             await self.show_mirrors(bot, message.chat.id, message.from_user.id, 0)
+
+    async def mailing(self, message: Message, bot: Bot, command: CommandObject):
+        if not message.from_user or message.from_user.id != MAILING_ADMIN_ID:
+            await bot.send_message(message.chat.id, 'Рассылка доступна только владельцу бота.')
+            return
+        text = (command.args or '').strip()
+        if not text:
+            await bot.send_message(message.chat.id, 'Укажите текст: /mailing текст')
+            return
+        # Telegram's limit is 4096 UTF-16 units after HTML parsing; reserve space for the heading.
+        if len(text.encode('utf-16-le')) // 2 > 4000:
+            await bot.send_message(message.chat.id, 'Текст слишком длинный: максимум 4000 единиц UTF-16.')
+            return
+        existing = self.manager.mailings.get(bot.id)
+        if existing and not existing.done():
+            await bot.send_message(message.chat.id, 'Рассылка для этого бота уже выполняется.')
+            return
+        recipients = self.store.mailing_recipients()
+        if not recipients:
+            await bot.send_message(message.chat.id, 'Пока нет получателей рассылки.')
+            return
+        await bot.send_message(message.chat.id, f'Рассылка запущена. Получателей: {len(recipients)}.')
+        self.manager.start_mailing(bot, self.store, recipients, text)
 
     async def show_mirrors(self, bot, chat_id: int, owner_id: int, page: int):
         mirrors = self.manager.list_for(owner_id)
@@ -973,9 +1127,17 @@ def build_dispatcher(app: SaveBot, mirrors=None) -> Dispatcher:
     dp.edited_business_message.register(edited)
     dp.deleted_business_messages.register(app.deleted)
     if mirrors is not None:
-        menu = Menu(mirrors)
+        menu = Menu(mirrors, app.store)
+        async def record_recipient(handler, event, data):
+            # Bot API private chats can only receive messages after the user contacts the bot.
+            if (event.chat.type == 'private' and event.from_user and not event.from_user.is_bot
+                    and event.chat.id == event.from_user.id):
+                app.store.remember_mailing_user(event.chat.id)
+            return await handler(event, data)
+        dp.message.outer_middleware(record_recipient)
         dp.message.register(menu.start, CommandStart(), F.chat.type == 'private')
         dp.message.register(menu.mirrors, Command('mirrors'), F.chat.type == 'private')
+        dp.message.register(menu.mailing, Command('mailing'), F.chat.type == 'private')
         dp.callback_query.register(menu.callback, F.data.startswith('menu:'))
         dp.message.register(menu.receive_token, F.chat.type == 'private')
     return dp

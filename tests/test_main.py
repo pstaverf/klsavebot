@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock
 import pytest
 from aiogram.types import BusinessConnection, BusinessMessagesDeleted, Chat, Message, PhotoSize, User
 
-from main import Config, SaveBot, Store, expiring_hint
+from main import (Config, SaveBot, Store, expiring_hint, is_expiring_media,
+                  EMOJI_DELETE, EMOJI_EDIT, EMOJI_EXPIRING)
 
 OWNER = User(id=1, is_bot=False, first_name='Owner')
 OTHER = User(id=2, is_bot=False, first_name='Other')
@@ -230,7 +231,8 @@ async def test_media_and_replies_use_correct_business_owner(setup):
     incoming = incoming.model_copy(update={'business_connection_id': 'second'})
     await app.message(incoming, bot)
     assert bot.send_photo.await_args.args[0] == 333
-    assert 'Исчезающее медиа!' in bot.send_photo.await_args.kwargs['caption']
+    assert 'Медиа из сообщения!' in bot.send_photo.await_args.kwargs['caption']
+    assert 'Исчезающее медиа!' not in bot.send_photo.await_args.kwargs['caption']
     reply = msg(71, 'save', second_owner, reply_to_message=incoming).model_copy(update={'business_connection_id': 'second'})
     await app.message(reply, bot)
     assert bot.send_photo.await_args.args[0] == 333
@@ -315,7 +317,7 @@ async def test_deleted_text_format_and_escaping(setup):
     await app.message(incoming, bot)
     await app.deleted(BusinessMessagesDeleted(business_connection_id='conn', chat=CHAT, message_ids=[101]), bot)
     assert bot.send_message.await_args.args[1] == (
-        '<b>Сообщение было удалено!</b>\n\n'
+        f'{EMOJI_DELETE} <b>Сообщение было удалено!</b>\n\n'
         '<a href="tg://user?id=2">&lt;kaff&gt;</a> удалил(-а) своё сообщение (#m101):\n\n'
         '<blockquote>Message: &lt;b&gt;hello &amp; goodbye&lt;/b&gt;</blockquote>\n\n'
         '<b>Этот бот KLSave.</b> Максимум функций и меньше ограничений по функционалу.'
@@ -335,7 +337,7 @@ async def test_deleted_media_has_caption(setup, kind, method_name):
     await app.deleted(BusinessMessagesDeleted(business_connection_id='conn', chat=CHAT, message_ids=[102]), bot)
     method = getattr(bot, method_name)
     caption = method.await_args.kwargs['caption']
-    assert caption == (f'<b>Сообщение было удалено!</b>\n\n<a href="tg://user?id=2">kaff</a> удалил(-а) своё сообщение (#m102):\n\n'
+    assert caption == (f'{EMOJI_DELETE} <b>Сообщение было удалено!</b>\n\n<a href="tg://user?id=2">kaff</a> удалил(-а) своё сообщение (#m102):\n\n'
                        f'Тип сообщения: {kind}\n\n<b>Этот бот KLSave.</b> Максимум функций и меньше ограничений по функционалу.')
     assert method.await_args.kwargs['parse_mode'] == 'HTML'
     bot.send_message.assert_not_awaited()
@@ -363,11 +365,11 @@ async def test_photo_expiring_caption_and_long_text_limit(setup):
     async def download(path, destination):
         destination.write_bytes(b'image')
     bot.download_file.side_effect = download
-    incoming = msg(104, body=None, caption='🙂' * 1000, has_media_spoiler=True,
+    incoming = msg(104, body=None, caption='🙂' * 1000, ttl_seconds=5,
                    photo=[PhotoSize(file_id='a', file_unique_id='a', width=1, height=1)])
     await app.message(incoming, bot)
     caption = bot.send_photo.await_args.kwargs['caption']
-    assert caption.startswith('<b>Исчезающее медиа!</b>\n\n<a href="tg://user?id=2">Other</a> отправил(-а) своё сообщение (#m104):\n\nMessage: ')
+    assert caption.startswith(f'{EMOJI_EXPIRING} <b>Исчезающее медиа!</b>\n\n<a href="tg://user?id=2">Other</a> отправил(-а) своё сообщение (#m104):\n\nMessage: ')
     assert caption.endswith('<b>Этот бот KLSave.</b> Максимум функций и меньше ограничений по функционалу.')
     assert len(caption.encode('utf-16-le')) // 2 <= 1024
     bot.send_message.assert_not_awaited()
@@ -408,7 +410,7 @@ async def test_edit_format_includes_clickable_author_and_versions(setup):
     await app.message(msg(201, 'До'), bot)
     await app.message(msg(201, 'После'), bot, edited=True)
     assert bot.send_message.await_args.args[1] == (
-        '<b>Сообщение было изменено!</b>\n\n'
+        f'{EMOJI_EDIT} <b>Сообщение было изменено!</b>\n\n'
         '<a href="tg://user?id=2">Other</a> отредактировал(-а) своё сообщение (#m201):\n\n'
         'Было: До\nСтало: После\n\n'
         '<b>Этот бот KLSave.</b> Максимум функций и меньше ограничений по функционалу.'
@@ -428,7 +430,7 @@ async def test_multiple_deletions_grouped_by_author_excluding_owner(setup):
                                               message_ids=[202, 203, 204, 205, 999]), bot)
     assert bot.send_message.await_count == 2
     group = bot.send_message.await_args_list[0].args[1]
-    assert group.startswith('<b>Были удалены сообщения!</b>')
+    assert group.startswith(f'{EMOJI_DELETE} <b>Были удалены сообщения!</b>')
     assert '<a href="tg://user?id=2">Other</a>' in group
     assert '(#m202, #m203)' in group
     assert 'Message: #m202: Ток немецкий номер скажи\n#m203: Лагична же' in group
@@ -477,7 +479,7 @@ async def test_expiring_video_note_follows_text(setup):
     calls = []
     bot.send_message.side_effect = lambda *args, **kwargs: calls.append('message')
     bot.send_video_note.side_effect = lambda *args, **kwargs: calls.append('video_note')
-    incoming = msg(400, body=None, has_media_spoiler=True,
+    incoming = msg(400, body=None, is_view_once=True,
                    video_note=VideoNote(file_id='v', file_unique_id='v', length=10, duration=1))
     await app.message(incoming, bot)
     assert calls == ['message', 'video_note']
@@ -486,3 +488,64 @@ async def test_expiring_video_note_follows_text(setup):
     assert '<a href="tg://user?id=2">Other</a>' in text
     assert '#m400' in text and 'Message:' in text
     assert '<b>Этот бот KLSave.</b>' in text
+
+
+@pytest.mark.asyncio
+async def test_reply_to_regular_video_note_is_not_called_expiring(setup):
+    from aiogram.types import VideoNote
+    app, bot = setup
+    bot.get_file.return_value = SimpleNamespace(file_path='note.mp4', file_size=5)
+    async def download(path, destination):
+        destination.write_bytes(b'video')
+    bot.download_file.side_effect = download
+    incoming = msg(500, body=None, video_note=VideoNote(file_id='v', file_unique_id='v', length=10, duration=1))
+    await app.message(incoming, bot)
+    await app.message(msg(501, 'обычный ответ', OWNER, reply_to_message=incoming), bot)
+    text = bot.send_message.await_args.args[1]
+    assert '<b>Медиа из сообщения!</b>' in text
+    assert 'Исчезающее медиа!' not in text
+    assert '#m500' in text
+    assert bot.send_video_note.await_count == 1
+    assert app.store.get('conn', 2, 500)['media_status'] == 'downloaded'
+    # Delete notifications still attach the original circle as before.
+    await app.deleted(BusinessMessagesDeleted(business_connection_id='conn', chat=CHAT, message_ids=[500]), bot)
+    assert 'Сообщение было удалено!' in bot.send_message.await_args.args[1]
+    assert bot.send_video_note.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_view_once_reply_still_saved_and_correctly_labeled(setup):
+    from aiogram.types import VideoNote
+    app, bot = setup
+    bot.get_file.return_value = SimpleNamespace(file_path='note.mp4', file_size=5)
+    async def download(path, destination):
+        destination.write_bytes(b'video')
+    bot.download_file.side_effect = download
+    incoming = msg(510, body=None, is_view_once=True,
+                   video_note=VideoNote(file_id='v', file_unique_id='v', length=10, duration=1))
+    await app.message(msg(511, 'любой ответ', OWNER, reply_to_message=incoming), bot)
+    assert '<b>Исчезающее медиа!</b>' in bot.send_message.await_args.args[1]
+    assert bot.send_video_note.await_count == 1
+    assert app.store.get('conn', 2, 510)['media_status'] == 'downloaded'
+
+
+@pytest.mark.parametrize('field,value', [
+    ('is_view_once', False), ('view_once', 'false'), ('ttl_seconds', 0),
+    ('ttl', '0'), ('self_destruct', None), ('is_view_once', 'no'),
+])
+def test_false_expiration_markers_do_not_classify_as_expiring(field, value):
+    assert not is_expiring_media(msg(520, **{field: value}))
+
+
+def test_spoiler_and_nested_reply_do_not_prove_expiration():
+    nested = msg(530, is_view_once=True)
+    current = msg(531, has_media_spoiler=True, reply_to_message=nested)
+    assert expiring_hint(current)  # Spoilers can still be proactively saved.
+    assert not is_expiring_media(current)
+    assert is_expiring_media(nested)
+
+
+def test_expiration_marker_inside_media_is_recognized():
+    from aiogram.types import VideoNote
+    media = VideoNote(file_id='v', file_unique_id='v', length=10, duration=1, ttl_seconds=5)
+    assert is_expiring_media(msg(540, body=None, video_note=media))
