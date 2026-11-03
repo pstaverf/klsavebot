@@ -1,381 +1,54 @@
-<div align="center">
+# Mnemora Save Mode
 
-<img src="assets/readme/hero.png" alt="Mnemora hero" width="720">
+Telegram Business-бот для сохранения входящих сообщений и доступных медиа: при удалении присылает сохранённую копию, при изменении показывает старую и новую версии. Исчезающие медиа пытается скачать сразу. Каждый пользователь может подключить бота к своему Telegram Business и получает уведомления только о сообщениях своих чатов. Свои сообщения владелец не получает в уведомлениях об изменении или удалении. Другие функции старого проекта удалены, включая Telethon/userbot, AI, команды и автоответчик.
 
-# Mnemora — Telegram Business Save Mode & AI Assistant
+## Запуск
 
-**Персональный Telegram Business ассистент с локальной памятью, SAVE MODE, AI-выжимками и безопасными черновиками ответов.**
+1. Создайте бота через @BotFather.
+2. Скопируйте `.env.example` в `.env`, заполните `BOT_TOKEN` и `WEBHOOK_BASE_URL` публичным HTTPS-адресом. ID владельца не требуется.
+3. Настройте HTTPS-прокси, затем запустите `docker compose up -d --build` или установите `pip install -r requirements.txt` и выполните `python main.py` (Python 3.11+).
+4. Каждый пользователь должен написать боту `/start` в личных сообщениях. Затем в Telegram Business открыть настройки чат-ботов, подключить бота и разрешить доступ к нужным чатам и сообщениям.
 
-![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)
-![Telethon](https://img.shields.io/badge/Telethon-legacy-0088CC?style=for-the-badge&logo=telegram&logoColor=white)
-![SQLite](https://img.shields.io/badge/SQLite%20%2B%20FTS5-local-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)
-![LLM](https://img.shields.io/badge/Claude%20%7C%20OpenAI%20%7C%20Gemini-supported-111827?style=for-the-badge)
-![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
+База и файлы хранятся в `data/` на сервере оператора бота. Все пользователи доверяют оператору доступ к своим сохраняемым сообщениям и медиа; оператор должен защитить `.env`, базу, файлы и резервные копии. Архивы логически разделены по Business-подключениям, но хранятся в общей базе без шифрования. Для обновления старого проекта сохраните резервную копию `data/`. При первом запуске новые таблицы импортируют входящие Business-сообщения из старой SQLite-базы `data/app.db`, не изменяя старые таблицы. Для другого пути укажите `DATABASE_URL=sqlite+aiosqlite:///путь/к/файлу`. Docker сохраняет только содержимое подключённого каталога `data/`. Старые настройки управления ботом и другие данные не переносятся.
 
-</div>
+Бот получает только события после подключения (или ранее сохранённые в базе). Сообщения без определённого автора не обрабатываются, чтобы случайно не уведомлять о своих. Telegram не сообщает, кто инициировал удаление: уведомление определяется **автором** сообщения, а не тем, кто его удалил. Для сохранения медиа боту необходим доступ к файлу через Bot API; защищённые, одноразовые или уже исчезнувшие файлы могут быть недоступны. Спойлер не означает исчезающее медиа, хотя для него сохранение также запускается сразу. Заголовок «Исчезающее медиа» используется только при явном признаке одноразовости или таймера, переданном Telegram. Если признака нет, уведомление получает нейтральный заголовок, даже если Telegram скрыл информацию о времени жизни. Можно ответить любым сообщением на входящее медиа: бот попытается сохранить его и отправить владельцу, если Telegram передал медиа в ответе. Это относится и к обычным медиа, поскольку Bot API не всегда сообщает, что медиа исчезающее. Ограничение размера задаётся `MAX_MEDIA_SIZE_MB`; у Telegram Bot API могут быть более строгие ограничения. Это не обход защиты Telegram.
 
-## 📌 Быстрая Сводка
+Получатель уведомлений и автор собственных сообщений определяются по данным соответствующего Business-подключения Telegram, а не из `.env`. Отключённые подключения не обрабатываются. Старые подключения без адреса чата подтверждаются через Telegram при первом событии.
 
-| Раздел | Описание |
-| --- | --- |
-| Основной режим | Telegram Business automation bot через Bot API |
-| SAVE MODE | Сохраняет удалённые сообщения, правки и доступные медиа |
-| AI Assistant | Поиск, summary, catchup, задачи, напоминания, дайджесты |
-| Локальная память | SQLite + FTS5, без внешнего векторного сервиса по умолчанию |
-| Legacy mode | Telethon userbot остаётся как optional backend для отдельных legacy-сценариев |
+Уведомления об удалениях, правках и сохранённом медиа содержат ссылку на автора (если Telegram позволяет открыть профиль) и номер сообщения. Несколько сообщений из одного уведомления об удалении группируются по автору; при большом количестве список делится на части. Медиа из такой группы отправляются отдельно с номером сообщения. Текст в уведомлениях может сокращаться из-за ограничений Telegram, полная версия остаётся в базе. Строка «удалил(-а)» в шаблоне обозначает автора, а не достоверно установленного инициатора удаления.
 
-## ✨ Основные Возможности
+## Зеркала
 
-| Возможность | Что делает |
-| --- | --- |
-| Telegram Business mode | Бот подключается в Telegram: `Настройки -> Telegram Business -> Чат-боты` |
-| Удалённые сообщения | Помечает сообщения удалёнными и присылает владельцу сохранённую копию |
-| История правок | Сохраняет старый и новый текст, показывает аккуратное уведомление |
-| Медиа | Скачивает фото, видео, документы, стикеры и другие доступные Bot API файлы |
-| Истекающие медиа | Пытается сохранить сразу, если Telegram Bot API отдаёт файл обычным способом |
-| Скрытые voice/audio | Обычные voice/audio не сохраняются; одноразовые сохраняются только reply-действием владельца |
-| Поиск | `/search текст` ищет по локальной базе через SQLite FTS5 |
-| AI | Поддерживает Anthropic Claude, OpenAI и Gemini через единый LLM router |
-| Черновики ответов | Любая отправка от имени Business-аккаунта идёт через inline-подтверждение |
-| Dot commands | `.mute`, `.info`, `.repeat`, `.type`, `.love` работают в Business mode в том же чате |
+Команда `/mirrors` позволяет добавить отдельного Telegram-бота по токену @BotFather и управлять своими зеркалами. У каждого зеркала отдельные база и медиа в `data/mirrors/<bot_id>/`. Само зеркало работает в том же процессе и на том же сервере, что и основной бот, поэтому его работа зависит от доступности этого сервера. После добавления включите для него **Business Mode** в настройках @BotFather, напишите зеркалу `/start` и подключите его в Telegram Business. При добавлении бот устанавливает собственный вебхук зеркала и заменяет ранее настроенный для этого токена webhook. Не запускайте другой экземпляр с тем же токеном: он может перезаписать настройки вебхука. При перезапуске сервера сохранённые зеркала запускаются снова; если запуск не удался, зеркало останется в списке со статусом «остановлено». Удалить зеркало может только добавивший его пользователь: обработка останавливается и токен удаляется из реестра. Бот пытается отключить свой вебхук в Telegram; если Telegram недоступен, локальная обработка всё равно прекращается, а вебхук может потребовать ручного отключения или отзыва токена. Архив сообщений и медиа при этом автоматически не удаляется — администратору сервера следует удалить его отдельно, если он больше не нужен.
 
-## 🧩 Telegram Business Mode
+**Токен зеркала — пароль от бота.** Передавайте его только серверу, которому доверяете: оператор сервера имеет техническую возможность прочитать токен и содержимое архивов. Сообщение с токеном отправляется через обычный чат с ботом, не через сквозное шифрование; бот пытается удалить его после получения, но при неудаче попросит удалить вручную. Токены шифруются в базе; ключ автоматически создаётся в `data/mirror.key` с правами 0600. Ключ хранится на том же сервере, поэтому это защита от утечки одной лишь базы, а не от владельца или взлома сервера. Сохраняйте ключ вместе с базой в защищённой резервной копии: без него восстановить токены невозможно. Не публикуйте ключ, `.env`, базы и резервные копии. При компрометации токена отзовите его через @BotFather. Для нестандартного `DATABASE_URL` ключ и каталог `mirrors/` находятся рядом с файлом базы; убедитесь, что они сохраняются в постоянном томе.
 
-Это основной режим Mnemora. Он работает как обычный Telegram-бот, подключённый к твоему Business-аккаунту.
+## Вебхук и HTTPS
 
-### Как подключить
+Бот больше не использует polling. Укажите в `.env` публичный `WEBHOOK_BASE_URL`, например `https://bot.example.com`, и направьте HTTPS-трафик на этот сервер. Сертификат должен быть действительным и доверенным Telegram; поддерживаются публичные порты 443, 80, 88 и 8443. Приложение слушает HTTP на `WEBHOOK_HOST=0.0.0.0` и `WEBHOOK_PORT=8080`; TLS завершается на обратном прокси. Docker Compose публикует этот порт только на `127.0.0.1`, поэтому прокси должен находиться на том же сервере.
 
-1. Открой Telegram.
-2. Перейди в `Настройки`.
-3. Открой `Telegram Business`.
-4. Выбери `Чат-боты` или `Автоматизация чатов`.
-5. Выбери своего бота.
-6. Дай права на управление сообщениями и доступ к нужным личным чатам.
-7. Вернись в Mnemora и отправь `/business_status`.
+Пример для nginx (сертификат и DNS нужно настроить заранее):
 
-Mnemora принимает business updates:
-
-| Update | Назначение |
-| --- | --- |
-| `business_connection` | Сохраняет подключение, права и статус |
-| `business_message` | Сохраняет новые сообщения и доступные медиа |
-| `edited_business_message` | Сохраняет историю правок |
-| `deleted_business_messages` | Помечает сообщения удалёнными и уведомляет владельца |
-
-## 🗑 SAVE MODE
-
-SAVE MODE работает только с тем, что Telegram реально отдаёт боту через Bot API или Telethon.
-
-| Событие | Поведение |
-| --- | --- |
-| Удаление | Присылает владельцу текст, автора, чат, время и сохранённое медиа, если оно есть |
-| Правка | Показывает `Было` и `Стало`, без лишних рекламных строк |
-| Фото/видео | Отправляет как вложение с подписью, а не отдельным файлом-документом |
-| Обычные voice/audio | Не сохраняются, чтобы не засорять архив |
-| Одноразовые voice/audio | Сохраняются только когда владелец отвечает на скрытое сообщение, и Bot API даёт файл |
-| Недоступное медиа | Сохраняется metadata: chat_id, message_id, media type, status/error |
-
-Mnemora не обходит protected content, view-once, DRM или приватные ограничения Telegram. Если API не отдаёт файл, проект сохраняет только metadata.
-
-## 🤖 AI Assistant
-
-AI-функции работают по локально сохранённым business messages и не отправляют всю историю в LLM.
-
-| Команда | Назначение |
-| --- | --- |
-| `/summary чат` | Краткая выжимка последних сообщений |
-| `/catchup чат` | Где остановились и что важно помнить |
-| `/todos` | Задачи, обещания и дедлайны |
-| `/remind фраза` | Напоминание из обычного текста |
-| `/digest now` | Дайджест по важным чатам |
-| `/autoreply on/off` | Автоответчик, выключен по умолчанию |
-
-LLM router поддерживает:
-
-- `anthropic` / Claude через `ANTHROPIC_API_KEY`
-- `openai` через `OPENAI_API_KEY`
-- `gemini` через `GEMINI_API_KEY`
-
-## ⚡ Dot Commands
-
-Dot-команды в основном режиме `TELEGRAM_MODE=business` выполняются через Telegram Business Bot API и `business_connection_id` прямо в том же чате, где ты их вызвал.  
-Control-бот в ЛС используется для настроек, логов и уведомлений SAVE MODE.
-
-| Команда | Описание |
-| --- | --- |
-| `.mute` | Hard mute текущего чата: входящие сообщения сохраняются в Mnemora и удаляются из переписки, если Telegram позволит |
-| `.unmute` | Выключает hard mute для текущего чата |
-| `.info` | Показывает доступную Telegram API информацию о пользователе. Использовать reply на сообщение |
-| `.type текст` | Показывает typing и отправляет текст |
-| `.repeat n текст` | Ограниченный повтор текста в текущий чат с плавающей задержкой |
-| `.spam n текст` | Alias для `.repeat`, не массовая рассылка |
-| `.spam_stop` | Остановить активный repeat/spam в текущем чате |
-| `.love` | Короткая безопасная анимация до 5 сообщений |
-
-Важно:
-
-- `.mute` hard mode в business режиме пытается удалить сообщение через `deleteBusinessMessages`; итог зависит от прав Telegram Business.
-- Удаление “для всех” может не сработать из-за ограничений Telegram.
-- `.info` не показывает дату регистрации: официально она недоступна через Telegram API.
-- `.spam` не делает массовую рассылку, не ходит по спискам чатов и ограничен текущим диалогом.
-- Для repeat используется плавающая задержка `REPEAT_DELAY_MIN_SECONDS..REPEAT_DELAY_MAX_SECONDS`.
-
-## 🛠 Установка
-
-```bash
-git clone https://github.com/22Warm-XD/natursavebot.git
-cd natursavebot
-cp .env.example .env
+```nginx
+server {
+    listen 443 ssl;
+    server_name bot.example.com;
+    ssl_certificate /etc/letsencrypt/live/bot.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/bot.example.com/privkey.pem;
+    client_max_body_size 5m;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+    }
+}
 ```
 
-Сгенерируй ключ шифрования:
+Если адрес содержит префикс пути, прокси должен передавать его **без удаления**. При запуске бот автоматически регистрирует отдельные URL для основного бота и зеркал и заменяет существующие вебхуки этих токенов. Токены не включаются в URL; дополнительно проверяется секретный заголовок Telegram. Не записывайте секретные заголовки и пути вебхуков в логи прокси. Повторные доставки одного `update_id` подавляются в базе в течение 7 дней после успешной обработки. При штатной остановке вебхуки остаются зарегистрированными, чтобы Telegram мог повторять доставку во время перезапуска. Для перехода на polling вебхук нужно отдельно удалить через Telegram Bot API.
 
-```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
+## Рассылка
 
-Вставь результат в `ENCRYPTION_KEY`.
+`/mailing текст` в личном чате доступна только Telegram-пользователю с ID `6025818386` — в основном боте и во всех зеркалах. Сообщение отправляется пользователям **того бота**, которому дана команда; аудитории основного бота и зеркал не объединяются. Получатели добавляются в базу, когда пишут боту в личные сообщения. Установленные до появления этой функции пользователи автоматически не восстанавливаются: им нужно снова написать боту. Команда владельца тоже считается личным сообщением, поэтому владелец получит рассылку, если не заблокировал бота.
 
-## ⚙️ Настройка `.env`
-
-Минимальный набор:
-
-```env
-BOT_TOKEN=
-OWNER_TELEGRAM_ID=
-ENCRYPTION_KEY=
-
-TELEGRAM_MODE=business
-DATABASE_URL=sqlite+aiosqlite:///data/app.db
-MEDIA_DIR=data/media
-
-SAVE_MODE_ENABLED=true
-SAVE_MEDIA_ENABLED=true
-MAX_MEDIA_SIZE_MB=50
-
-LLM_PROVIDER=anthropic
-ANTHROPIC_API_KEY=
-ANTHROPIC_MODEL=claude-3-5-sonnet-latest
-```
-
-Полный список параметров лежит в `.env.example`.
-
-## 🚀 Установка На Сервер Через Curl
-
-Для Ubuntu/Debian можно поставить production-helper одной командой:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/22Warm-XD/natursavebot/main/install.sh | sudo bash
-```
-
-Installer:
-
-- проверяет Ubuntu/Debian и Docker Compose plugin;
-- при необходимости ставит Docker Engine и `docker-compose-plugin`;
-- кладёт исходники в `/opt/natursavebot/app`;
-- кладёт управляющие скрипты в `/opt/natursavebot/bin`;
-- создаёт удобные команды в `/usr/local/bin`;
-- спрашивает `INSTANCE_NAME`, `BOT_TOKEN`, `BOT_USERNAME`, `OWNER_TELEGRAM_ID`, `SUPERADMIN_ID`, `TIMEZONE`, media-настройки и LLM keys;
-- генерирует `ENCRYPTION_KEY` автоматически;
-- создаёт `.env`, `compose.yml`, `data/` и запускает `docker compose up -d --build`;
-- не копирует реальный `.env` и не перетирает секреты без подтверждения.
-
-Создать отдельного бота-инстанс:
-
-```bash
-sudo natursavebot-create-instance mnemora-timur
-```
-
-Каждый инстанс живёт отдельно:
-
-```text
-/opt/natursavebot/<INSTANCE_NAME>/
-  .env
-  compose.yml
-  data/app.db
-  data/media/
-  app/
-```
-
-Если инстанс уже существует, installer не перетрёт `.env` без подтверждения. Для второго и следующих ботов используй ту же команду `natursavebot-create-instance`: она интерактивно спросит настройки и создаст отдельный контейнер.
-
-Полезные команды:
-
-```bash
-sudo natursavebot-list-instances
-sudo natursavebot-update-instance mnemora-timur
-sudo natursavebot-remove-instance mnemora-timur
-sudo docker compose --project-directory /opt/natursavebot/mnemora-timur -f /opt/natursavebot/mnemora-timur/compose.yml logs -f
-sudo docker compose --project-directory /opt/natursavebot/mnemora-timur -f /opt/natursavebot/mnemora-timur/compose.yml restart
-sudo docker compose --project-directory /opt/natursavebot/mnemora-timur -f /opt/natursavebot/mnemora-timur/compose.yml stop
-```
-
-Backup данных инстанса:
-
-```bash
-sudo tar -czf natursavebot-mnemora-timur-backup.tgz -C /opt/natursavebot/mnemora-timur data
-```
-
-### Несколько Ботов На Одном Сервере
-
-Создай несколько инстансов с разными именами:
-
-```bash
-sudo natursavebot-create-instance mnemora-timur
-sudo natursavebot-create-instance mnemora-wife
-sudo natursavebot-create-instance mnemora-kids
-```
-
-У каждого инстанса свой:
-
-- `BOT_TOKEN`;
-- `OWNER_TELEGRAM_ID`;
-- `.env`;
-- SQLite DB;
-- `data/media`;
-- `container_name`;
-- Docker Compose project.
-
-Данные между инстансами не смешиваются.
-
-## 🐳 Запуск Через Docker
-
-```bash
-docker compose up -d --build
-docker compose logs -f mnemora
-```
-
-Остановить:
-
-```bash
-docker compose down
-```
-
-## 💻 Локальный Запуск
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-python -m src.main
-```
-
-Для Linux/macOS:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python -m src.main
-```
-
-## 📋 Команды
-
-### Business / SAVE MODE
-
-| Команда | Описание |
-| --- | --- |
-| `/start` | Onboarding и краткая инструкция подключения |
-| `/business_status` | Статус Telegram Business подключения |
-| `/savemode on` | Включить SAVE MODE |
-| `/savemode off` | Выключить SAVE MODE |
-| `/savemode_settings` | Inline-настройки SAVE MODE |
-| `/deleted` | Последние удалённые сообщения |
-| `/edits` | Последние правки |
-| `/media` | Последние сохранённые медиа |
-| `/search текст` | Поиск по локальной базе |
-| `/chat имя/id` | Карточка чата |
-| `/health` | Проверка БД, медиа-папки, LLM и Business connection |
-
-### AI
-
-| Команда | Описание |
-| --- | --- |
-| `/summary чат` | Выжимка последних сообщений |
-| `/catchup чат` | Где остановились |
-| `/todos` | Задачи и обещания |
-| `/remind фраза` | Создать напоминание |
-| `/digest now/on/off/at HH:MM` | Дайджесты |
-| `/autoreply on/off` | Автоответчик |
-| `/reply имя | текст` | Черновик ответа с inline-подтверждением |
-
-### Dot Commands
-
-| Команда | Описание |
-| --- | --- |
-| `.mute` | Hard mute текущего чата |
-| `.unmute` | Выключить hard mute |
-| `.info` | Информация о пользователе через reply |
-| `.type текст` | Typing + отправка текста |
-| `.spam n текст` | Ограниченный повтор, alias |
-| `.repeat n текст` | Ограниченный повтор, рекомендуемое имя |
-| `.spam_stop` | Остановить активный repeat |
-| `.love` | Короткая анимация |
-
-## ⚠️ Ограничения Telegram API
-
-- Mnemora не восстанавливает сообщения, отправленные до подключения бота.
-- Бот видит только чаты, к которым владелец дал доступ в Telegram Business.
-- Protected/view-once/self-destruct медиа сохраняются только если Telegram API отдаёт файл обычным способом.
-- Обычные voice/audio не архивируются; одноразовые voice/audio сохраняются через reply-сценарий владельца.
-- Дата регистрации пользователя недоступна через официальный Telegram API.
-- Удаление “для всех” в hard mute может быть запрещено Telegram.
-
-## 🧱 Структура Проекта
-
-```text
-src/
-  main.py
-  config.py
-  db/
-    models.py
-    repositories/
-  bot/
-    handlers/
-  business_bot/
-    handlers.py
-    media_downloader.py
-    notifications.py
-    sender.py
-  userbot/
-    commands.py
-    events.py
-    media.py
-  services/
-    llm/
-    hard_mute.py
-    save_mode_business.py
-tests/
-legacy/
-assets/
-data/
-install.sh
-scripts/
-```
-
-## 🖼 Скриншоты
-
-Скриншоты будут добавлены после первого стабильного production-запуска без личных данных и секретов.
-
-## 🧪 Проверка
-
-```bash
-python -m compileall src tests
-python -m pytest
-```
-
-Если установлен Docker:
-
-```bash
-docker compose config
-```
-
----
-
-<div align="center">
-
-**Mnemora сохраняет память Telegram аккуратно: без обходов, без лишней магии и без утечки секретов.**
-
-</div>
+Текст рассылки передаётся как обычный текст: HTML-теги в нём не исполняются. Одновременно работает не более одной рассылки на бот, отправка ограничена по скорости с учётом ответа Telegram о flood limit; по завершении владелец получает число успешных и неуспешных отправок. Если пользователь заблокировал бота, он удаляется из списка и добавится снова, когда напишет после разблокировки. При остановке сервера или удалении зеркала выполняющаяся рассылка прерывается и автоматически не возобновляется. Указанные пользовательские эмодзи используются в уведомлениях; если Telegram не разрешает их конкретному боту, отправка повторяется с обычными эмодзи.
